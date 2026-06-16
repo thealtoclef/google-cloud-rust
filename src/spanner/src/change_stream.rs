@@ -237,6 +237,23 @@ impl ChangeStreamRecordStream {
     }
 }
 
+/// The oneof field names in `ChangeStreamRecord`. When Spanner returns a
+/// struct with all 5 fields present (4 as null, 1 populated), the generated
+/// serde deserializer treats each non-`None` variant as "record already set"
+/// and errors. We strip null oneof keys before deserializing to avoid this.
+const ONEOF_FIELDS: &[&str] = &[
+    "dataChangeRecord",
+    "data_change_record",
+    "heartbeatRecord",
+    "heartbeat_record",
+    "partitionStartRecord",
+    "partition_start_record",
+    "partitionEndRecord",
+    "partition_end_record",
+    "partitionEventRecord",
+    "partition_event_record",
+];
+
 fn parse_change_stream_records(
     json_value: &serde_json::Value,
 ) -> crate::Result<Vec<ChangeStreamRecord>> {
@@ -253,13 +270,30 @@ fn parse_change_stream_records(
 
     let mut records = Vec::with_capacity(array.len());
     for element in array {
-        let record: ChangeStreamRecord = serde_json::from_value(element.clone()).map_err(|e| {
+        let cleaned = strip_null_oneof_fields(element);
+        let record: ChangeStreamRecord = serde_json::from_value(cleaned).map_err(|e| {
             crate::error::internal_error(format!("failed to deserialize ChangeStreamRecord: {e}"))
         })?;
         records.push(record);
     }
 
     Ok(records)
+}
+
+/// Remove null-valued oneof fields so the generated deserializer does not
+/// see them as duplicate `record` assignments.
+fn strip_null_oneof_fields(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let filtered: serde_json::Map<String, serde_json::Value> = map
+                .iter()
+                .filter(|(k, v)| !(v.is_null() && ONEOF_FIELDS.contains(&k.as_str())))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            serde_json::Value::Object(filtered)
+        }
+        other => other.clone(),
+    }
 }
 
 fn value_type_name(v: &serde_json::Value) -> &'static str {
@@ -451,6 +485,46 @@ mod tests {
         let json = serde_json::json!("not an array");
         let result = parse_change_stream_records(&json);
         assert!(result.is_err());
+    }
+
+    /// When Spanner's struct_type declares all 5 oneof fields and sends null
+    /// for the 4 inactive ones, the generated deserializer would error on the
+    /// second null field ("multiple values for record"). The null-stripping in
+    /// `parse_change_stream_records` must handle this.
+    #[test]
+    fn parse_record_with_null_oneof_fields() {
+        let json = serde_json::json!([{
+            "dataChangeRecord": null,
+            "heartbeatRecord": {
+                "timestamp": "2024-01-15T10:30:00Z"
+            },
+            "partitionStartRecord": null,
+            "partitionEndRecord": null,
+            "partitionEventRecord": null
+        }]);
+
+        let records = parse_change_stream_records(&json).expect("parse should succeed");
+        assert_eq!(records.len(), 1);
+        assert!(records[0].heartbeat_record().is_some());
+    }
+
+    #[test]
+    fn parse_record_with_null_oneof_fields_snake_case() {
+        let json = serde_json::json!([{
+            "data_change_record": null,
+            "heartbeat_record": null,
+            "partition_start_record": {
+                "startTimestamp": "2024-01-15T10:30:00Z",
+                "recordSequence": "00000001",
+                "partitionTokens": ["token-1"]
+            },
+            "partition_end_record": null,
+            "partition_event_record": null
+        }]);
+
+        let records = parse_change_stream_records(&json).expect("parse should succeed");
+        assert_eq!(records.len(), 1);
+        assert!(records[0].partition_start_record().is_some());
     }
 
     #[test]
