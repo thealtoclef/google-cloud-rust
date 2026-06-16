@@ -53,8 +53,10 @@
 //! [`PartitionStartRecord`](crate::model::change_stream_record::PartitionStartRecord)s
 //! that contain tokens for child partitions.  It is the caller's
 //! responsibility to spawn additional queries for those child partitions —
-//! this is the same model used by the Java and Go SDKs, which do not include
-//! a built-in concurrent partition scheduler either.
+//! this is the same model used by the other Spanner SDKs (Java, Go, Python,
+//! Node.js), none of which include a built-in concurrent partition scheduler.
+//! The Apache Beam Spanner Change Streams connector handles partition
+//! management at the Dataflow pipeline level.
 
 use crate::database_client::DatabaseClient;
 use crate::model::ChangeStreamRecord;
@@ -63,7 +65,7 @@ use crate::statement::Statement;
 
 // Characters that are never valid in a GoogleSQL identifier.
 // Used to reject obviously-bad change stream names.
-const INVALID_IDENT_CHARS: &[char] = &['`', '"', '\'', ';', '-', ' ', '\n', '\r', '\t', '\0'];
+const INVALID_IDENT_CHARS: &[char] = &['`', '"', '\'', ';', ' ', '\n', '\r', '\t', '\0'];
 
 /// Validates that `name` looks like a legal Spanner identifier and returns it
 /// backtick-escaped for safe interpolation into SQL.
@@ -88,6 +90,7 @@ fn escape_identifier(name: &str) -> crate::Result<String> {
 /// [`ChangeStreamRecordStream`] that yields deserialized
 /// [`ChangeStreamRecord`](crate::model::ChangeStreamRecord) values.
 #[derive(Clone, Debug)]
+#[must_use]
 pub struct ChangeStreamQueryBuilder {
     client: DatabaseClient,
     change_stream_name: String,
@@ -475,8 +478,8 @@ mod tests {
                 ],
                 "mods": [
                     {
-                        "keys": [{"column": "Id", "value": {"stringValue": "42"}}],
-                        "newValues": [{"column": "Name", "value": {"stringValue": "Alice"}}],
+                        "keys": [{"columnMetadataIndex": 0, "value": {"stringValue": "42"}}],
+                        "newValues": [{"columnMetadataIndex": 1, "value": {"stringValue": "Alice"}}],
                         "oldValues": []
                     }
                 ],
@@ -495,26 +498,32 @@ mod tests {
         assert_eq!(dcr.table, "Users");
         assert_eq!(dcr.column_metadata.len(), 2);
         assert_eq!(dcr.mods.len(), 1);
+        // Verify the ModValue fields are correctly deserialized (not absorbed by _unknown_fields).
+        assert_eq!(dcr.mods[0].keys[0].column_metadata_index, 0);
+        assert!(dcr.mods[0].keys[0].value.is_some());
+        assert_eq!(dcr.mods[0].new_values[0].column_metadata_index, 1);
+        assert!(dcr.mods[0].new_values[0].value.is_some());
         assert_eq!(dcr.transaction_tag, "my-tag");
     }
 
-    // ── mock-server integration test ──
+    // ── mock-server integration tests ──
 
     /// Verifies that `ChangeStreamQueryBuilder::execute()` sends the correct SQL
     /// and parameters to `ExecuteStreamingSql`, and that the returned
-    /// `ChangeStreamRecordStream` yields a correctly deserialized heartbeat record.
+    /// `ChangeStreamRecordStream` yields correctly deserialized records.
+    ///
+    /// The mock returns data in the production wire format:
+    /// - Column type: `ARRAY<STRUCT<...>>` (not JSON)
+    /// - Value: `ListValue` containing positional struct values
+    /// This exercises the real `FromValue for serde_json::Value` code path
+    /// through `list_value_to_json` with struct metadata.
     #[google_cloud_test_macros::tokio_test_no_panics]
-    async fn execute_end_to_end_mock() -> anyhow::Result<()> {
+    async fn execute_end_to_end_mock_heartbeat() -> anyhow::Result<()> {
         use crate::read_only_transaction::tests::{create_session_mock, setup_db_client};
         use crate::result_set::tests::adapt;
         use spanner_grpc_mock::google::spanner::v1 as mock_v1;
 
         let mut mock = create_session_mock();
-
-        // The change stream TVF returns a single column "ChangeRecord" of type
-        // JSON. We encode a heartbeat record as a JSON string inside a
-        // single-element array.
-        let heartbeat_json = r#"[{"heartbeatRecord":{"timestamp":"2024-01-15T10:30:00Z"}}]"#;
 
         mock.expect_execute_streaming_sql()
             .once()
@@ -535,6 +544,13 @@ mod tests {
                     req.sql
                 );
 
+                // Verify read_options => null is present.
+                assert!(
+                    req.sql.contains("read_options => null"),
+                    "SQL should contain read_options => null, got: {}",
+                    req.sql
+                );
+
                 // Verify heartbeat_milliseconds param is set.
                 let params = req.params.as_ref().expect("params should be set");
                 let hb = params
@@ -546,27 +562,93 @@ mod tests {
                     Some(prost_types::value::Kind::StringValue("5000".to_string()))
                 );
 
-                // Return a PartialResultSet with:
-                // - metadata: 1 column (ChangeRecord) of type JSON
-                // - values: the heartbeat JSON string
+                // Production wire format: the ChangeRecord column is
+                // ARRAY<STRUCT<heartbeat_record STRUCT<timestamp TIMESTAMP>, ...>>.
+                //
+                // The inner struct has a single field "heartbeat_record" which
+                // is itself a struct with a "timestamp" field.
+                //
+                // In protobuf wire format, STRUCT values are encoded as
+                // ListValue with positional elements matching the struct_type
+                // fields.
+
+                // Heartbeat record struct type: { timestamp: TIMESTAMP }
+                let heartbeat_struct_type = mock_v1::StructType {
+                    fields: vec![mock_v1::struct_type::Field {
+                        name: "timestamp".to_string(),
+                        r#type: Some(mock_v1::Type {
+                            code: mock_v1::TypeCode::Timestamp as i32,
+                            ..Default::default()
+                        }),
+                    }],
+                };
+
+                // Outer ChangeRecord struct type with one field:
+                // heartbeat_record: STRUCT<timestamp TIMESTAMP>
+                let change_record_struct_type = mock_v1::StructType {
+                    fields: vec![mock_v1::struct_type::Field {
+                        name: "heartbeat_record".to_string(),
+                        r#type: Some(mock_v1::Type {
+                            code: mock_v1::TypeCode::Struct as i32,
+                            struct_type: Some(heartbeat_struct_type),
+                            ..Default::default()
+                        }),
+                    }],
+                };
+
+                // Column type: ARRAY<STRUCT<...>>
+                let column_type = mock_v1::Type {
+                    code: mock_v1::TypeCode::Array as i32,
+                    array_element_type: Some(Box::new(mock_v1::Type {
+                        code: mock_v1::TypeCode::Struct as i32,
+                        struct_type: Some(change_record_struct_type),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+
+                // Value: an array (ListValue) containing one struct.
+                // The struct is itself a ListValue with positional values:
+                //   position 0 = heartbeat_record = STRUCT = ListValue[timestamp]
+                let heartbeat_struct_value = prost_types::Value {
+                    kind: Some(prost_types::value::Kind::ListValue(
+                        prost_types::ListValue {
+                            values: vec![prost_types::Value {
+                                kind: Some(prost_types::value::Kind::StringValue(
+                                    "2024-01-15T10:30:00Z".to_string(),
+                                )),
+                            }],
+                        },
+                    )),
+                };
+
+                let change_record_struct = prost_types::Value {
+                    kind: Some(prost_types::value::Kind::ListValue(
+                        prost_types::ListValue {
+                            values: vec![heartbeat_struct_value],
+                        },
+                    )),
+                };
+
+                let array_value = prost_types::Value {
+                    kind: Some(prost_types::value::Kind::ListValue(
+                        prost_types::ListValue {
+                            values: vec![change_record_struct],
+                        },
+                    )),
+                };
+
                 let prs = mock_v1::PartialResultSet {
                     metadata: Some(mock_v1::ResultSetMetadata {
                         row_type: Some(mock_v1::StructType {
                             fields: vec![mock_v1::struct_type::Field {
                                 name: "ChangeRecord".to_string(),
-                                r#type: Some(mock_v1::Type {
-                                    code: mock_v1::TypeCode::Json as i32,
-                                    ..Default::default()
-                                }),
+                                r#type: Some(column_type),
                             }],
                         }),
                         ..Default::default()
                     }),
-                    values: vec![prost_types::Value {
-                        kind: Some(prost_types::value::Kind::StringValue(
-                            heartbeat_json.to_string(),
-                        )),
-                    }],
+                    values: vec![array_value],
                     last: true,
                     ..Default::default()
                 };
@@ -590,6 +672,169 @@ mod tests {
         assert!(heartbeat.timestamp.is_some(), "timestamp should be present");
 
         // Stream should be exhausted.
+        assert!(stream.next().await.is_none());
+
+        Ok(())
+    }
+
+    /// Same as heartbeat test but exercises DataChangeRecord deserialization
+    /// through the production ARRAY<STRUCT<...>> wire format.
+    #[google_cloud_test_macros::tokio_test_no_panics]
+    async fn execute_end_to_end_mock_data_change() -> anyhow::Result<()> {
+        use crate::read_only_transaction::tests::{create_session_mock, setup_db_client};
+        use crate::result_set::tests::adapt;
+        use spanner_grpc_mock::google::spanner::v1 as mock_v1;
+
+        let mut mock = create_session_mock();
+
+        mock.expect_execute_streaming_sql()
+            .once()
+            .returning(move |_req| {
+                // Simplified DataChangeRecord struct type.
+                // Real wire has many fields; we include the key ones.
+                let dcr_struct_type = mock_v1::StructType {
+                    fields: vec![
+                        mock_v1::struct_type::Field {
+                            name: "commit_timestamp".to_string(),
+                            r#type: Some(mock_v1::Type {
+                                code: mock_v1::TypeCode::Timestamp as i32,
+                                ..Default::default()
+                            }),
+                        },
+                        mock_v1::struct_type::Field {
+                            name: "record_sequence".to_string(),
+                            r#type: Some(mock_v1::Type {
+                                code: mock_v1::TypeCode::String as i32,
+                                ..Default::default()
+                            }),
+                        },
+                        mock_v1::struct_type::Field {
+                            name: "server_transaction_id".to_string(),
+                            r#type: Some(mock_v1::Type {
+                                code: mock_v1::TypeCode::String as i32,
+                                ..Default::default()
+                            }),
+                        },
+                        mock_v1::struct_type::Field {
+                            name: "is_last_record_in_transaction_in_partition".to_string(),
+                            r#type: Some(mock_v1::Type {
+                                code: mock_v1::TypeCode::Bool as i32,
+                                ..Default::default()
+                            }),
+                        },
+                        mock_v1::struct_type::Field {
+                            name: "table".to_string(),
+                            r#type: Some(mock_v1::Type {
+                                code: mock_v1::TypeCode::String as i32,
+                                ..Default::default()
+                            }),
+                        },
+                    ],
+                };
+
+                let change_record_struct_type = mock_v1::StructType {
+                    fields: vec![mock_v1::struct_type::Field {
+                        name: "data_change_record".to_string(),
+                        r#type: Some(mock_v1::Type {
+                            code: mock_v1::TypeCode::Struct as i32,
+                            struct_type: Some(dcr_struct_type),
+                            ..Default::default()
+                        }),
+                    }],
+                };
+
+                let column_type = mock_v1::Type {
+                    code: mock_v1::TypeCode::Array as i32,
+                    array_element_type: Some(Box::new(mock_v1::Type {
+                        code: mock_v1::TypeCode::Struct as i32,
+                        struct_type: Some(change_record_struct_type),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+
+                // DataChangeRecord struct value (positional):
+                // [commit_timestamp, record_sequence, server_transaction_id,
+                //  is_last_record, table]
+                let dcr_value = prost_types::Value {
+                    kind: Some(prost_types::value::Kind::ListValue(
+                        prost_types::ListValue {
+                            values: vec![
+                                prost_types::Value {
+                                    kind: Some(prost_types::value::Kind::StringValue(
+                                        "2024-01-15T10:30:00Z".to_string(),
+                                    )),
+                                },
+                                prost_types::Value {
+                                    kind: Some(prost_types::value::Kind::StringValue(
+                                        "00000001".to_string(),
+                                    )),
+                                },
+                                prost_types::Value {
+                                    kind: Some(prost_types::value::Kind::StringValue(
+                                        "txn-789".to_string(),
+                                    )),
+                                },
+                                prost_types::Value {
+                                    kind: Some(prost_types::value::Kind::BoolValue(true)),
+                                },
+                                prost_types::Value {
+                                    kind: Some(prost_types::value::Kind::StringValue(
+                                        "Users".to_string(),
+                                    )),
+                                },
+                            ],
+                        },
+                    )),
+                };
+
+                let change_record = prost_types::Value {
+                    kind: Some(prost_types::value::Kind::ListValue(
+                        prost_types::ListValue {
+                            values: vec![dcr_value],
+                        },
+                    )),
+                };
+
+                let array_value = prost_types::Value {
+                    kind: Some(prost_types::value::Kind::ListValue(
+                        prost_types::ListValue {
+                            values: vec![change_record],
+                        },
+                    )),
+                };
+
+                let prs = mock_v1::PartialResultSet {
+                    metadata: Some(mock_v1::ResultSetMetadata {
+                        row_type: Some(mock_v1::StructType {
+                            fields: vec![mock_v1::struct_type::Field {
+                                name: "ChangeRecord".to_string(),
+                                r#type: Some(column_type),
+                            }],
+                        }),
+                        ..Default::default()
+                    }),
+                    values: vec![array_value],
+                    last: true,
+                    ..Default::default()
+                };
+
+                Ok(gaxi::grpc::tonic::Response::from(adapt([Ok(prs)])))
+            });
+
+        let (db_client, _server) = setup_db_client(mock).await;
+
+        let mut stream = db_client.change_stream_query("MyStream").execute().await?;
+
+        let records = stream.next().await.expect("should have one row")?;
+        assert_eq!(records.len(), 1);
+        let dcr = records[0]
+            .data_change_record()
+            .expect("should be a data change record");
+        assert_eq!(dcr.table, "Users");
+        assert_eq!(dcr.server_transaction_id, "txn-789");
+        assert!(dcr.is_last_record_in_transaction_in_partition);
+
         assert!(stream.next().await.is_none());
 
         Ok(())
