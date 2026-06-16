@@ -493,6 +493,11 @@ fn change_stream_record_to_entry(record: ChangeStreamRecord) -> crate::Result<Ch
 /// struct with all fields present (inactive ones as null), the generated
 /// serde deserializer errors on duplicate oneof fields. We strip null
 /// keys before deserializing.
+///
+/// **Maintenance:** keep this list in sync with the `record` oneof in
+/// `google/spanner/v1/change_stream.proto`. Both camelCase (JSON default)
+/// and snake_case (proto field name) variants are listed because Spanner
+/// may return either depending on the client library configuration.
 const ONEOF_FIELDS: &[&str] = &[
     "dataChangeRecord",
     "data_change_record",
