@@ -255,7 +255,47 @@ impl DatabaseClient {
         BatchWriteTransactionBuilder::new(self.clone())
     }
 
-    pub(crate) fn session_name(&self) -> String {
+    /// Returns a builder for a change stream query.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use google_cloud_spanner::client::Spanner;
+    /// # async fn run(spanner: Spanner) -> Result<(), google_cloud_spanner::Error> {
+    /// let db_client = spanner.database_client("projects/p/instances/i/databases/d").build().await?;
+    /// let mut stream = db_client.change_stream_query("MyChangeStream")
+    ///     .with_heartbeat_milliseconds(10_000)
+    ///     .execute()
+    ///     .await?;
+    /// while let Some(records) = stream.next().await {
+    ///     for record in records? {
+    ///         println!("{:?}", record);
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Builds and executes a change stream TVF query
+    /// (`SELECT ChangeRecord FROM READ_<name>(...)`) with `queryMode = PROFILE`,
+    /// returning a stream of fully-deserialized
+    /// [`ChangeStreamRecord`](crate::model::ChangeStreamRecord) values.
+    pub fn change_stream_query(
+        &self,
+        change_stream_name: impl Into<String>,
+    ) -> crate::change_stream::ChangeStreamQueryBuilder {
+        crate::change_stream::ChangeStreamQueryBuilder::new(self.clone(), change_stream_name)
+    }
+
+    /// Returns a reference to the underlying [`Spanner`] client.
+    ///
+    /// This can be used to issue lower-level RPCs such as
+    /// [`Spanner::execute_streaming_sql`].
+    pub fn spanner(&self) -> &Spanner {
+        &self.spanner
+    }
+
+    /// Returns the current session name for this database client.
+    pub fn session_name(&self) -> String {
         self.session_maintainer.session_name()
     }
 }

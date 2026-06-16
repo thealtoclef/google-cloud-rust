@@ -29,9 +29,9 @@ use gaxi::prost::ToProto;
 use prost::Message;
 use std::sync::LazyLock;
 
-/// The request builder for [SpannerImpl::execute_streaming_sql][crate::client::SpannerImpl::execute_streaming_sql] calls.
+/// The request builder for [`Spanner::execute_streaming_sql`][crate::client::Spanner::execute_streaming_sql] calls.
 #[derive(Clone, Debug)]
-pub(crate) struct ExecuteStreamingSql {
+pub struct ExecuteStreamingSql {
     grpc_client: gaxi::grpc::Client,
     request: ExecuteSqlRequest,
     options: crate::RequestOptions,
@@ -47,19 +47,19 @@ impl ExecuteStreamingSql {
     }
 
     /// Sets the full request, replacing any prior values.
-    pub(crate) fn with_request<V: Into<ExecuteSqlRequest>>(mut self, v: V) -> Self {
+    pub fn with_request<V: Into<ExecuteSqlRequest>>(mut self, v: V) -> Self {
         self.request = v.into();
         self
     }
 
     /// Sets all the options, replacing any prior values.
-    pub(crate) fn with_options<V: Into<crate::RequestOptions>>(mut self, v: V) -> Self {
+    pub fn with_options<V: Into<crate::RequestOptions>>(mut self, v: V) -> Self {
         self.options = v.into();
         self
     }
 
     /// Start the server streaming request and receive the stream.
-    pub(crate) async fn send(self) -> Result<PartialResultSetStream> {
+    pub async fn send(self) -> Result<PartialResultSetStream> {
         let session = self.request.session.clone();
         let request = self.request.to_proto().map_err(Error::deser)?;
         let stream = make_server_streaming_request(

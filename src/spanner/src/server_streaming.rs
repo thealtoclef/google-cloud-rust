@@ -12,5 +12,5 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) mod builder;
-pub(crate) mod stream;
+pub mod builder;
+pub mod stream;

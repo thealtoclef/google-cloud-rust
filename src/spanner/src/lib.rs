@@ -44,6 +44,9 @@ pub(crate) use google_cloud_gax::options::RequestOptions;
 pub(crate) use google_cloud_gax::options::internal::RequestBuilder;
 pub(crate) use google_cloud_gax::response::Response;
 
+/// Change stream query helpers.
+pub mod change_stream;
+
 /// Spanner client implementations.
 pub mod client;
 
@@ -83,7 +86,8 @@ pub(crate) mod result_set;
 pub(crate) mod result_set_metadata;
 pub(crate) mod retry_policy;
 pub(crate) mod row;
-pub(crate) mod server_streaming;
+/// Server streaming response types (e.g., for `ExecuteStreamingSql`).
+pub mod server_streaming;
 pub(crate) mod session_maintainer;
 pub(crate) mod timestamp_bound;
 pub(crate) mod to_value;
