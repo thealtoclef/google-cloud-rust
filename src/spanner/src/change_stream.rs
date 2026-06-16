@@ -437,12 +437,9 @@ impl ChangeStreamRecordStream {
             match parse_json_records(&json_value) {
                 Ok(mut entries) => {
                     if entries.is_empty() {
-                        // Empty array row — loop to pull the next row.
                         continue;
                     }
-                    // Reverse so we can pop from the back in order.
-                    entries.reverse();
-                    let first = entries.pop().unwrap();
+                    let first = entries.remove(0);
                     self.pending = entries;
                     return Some(Ok(first));
                 }
