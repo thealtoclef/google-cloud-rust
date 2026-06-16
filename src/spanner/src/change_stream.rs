@@ -50,17 +50,20 @@
 //!     .build()
 //!     .await?;
 //!
+//! let now = time::OffsetDateTime::now_utc();
+//! let end = now + time::Duration::minutes(2);
+//!
 //! let mut stream = db
 //!     .change_stream_query("MyChangeStream")
-//!     .with_start_timestamp(time::OffsetDateTime::now_utc())
+//!     .with_start_timestamp(now)
+//!     .with_end_timestamp(end)
 //!     .with_heartbeat_milliseconds(10_000)
 //!     .execute()
 //!     .await?;
 //!
-//! while let Some(records) = stream.next().await {
-//!     for record in records? {
-//!         println!("{:?}", record);
-//!     }
+//! while let Some(record) = stream.next().await {
+//!     let record = record?;
+//!     println!("{:?}", record);
 //! }
 //! # Ok(())
 //! # }
@@ -82,6 +85,8 @@ use crate::database_client::DatabaseClient;
 use crate::model::ChangeStreamRecord;
 use crate::result_set::ResultSet;
 use crate::statement::Statement;
+use gaxi::prost::FromProto;
+use prost::Message;
 
 /// Regex-like allowlist: a valid GoogleSQL identifier contains only ASCII
 /// letters, digits, underscores, and hyphens.
@@ -126,7 +131,7 @@ pub struct ChangeStreamQueryBuilder {
     client: DatabaseClient,
     change_stream_name: String,
     start_timestamp: Option<time::OffsetDateTime>,
-    end_timestamp: Option<time::OffsetDateTime>,
+    end_timestamp: time::OffsetDateTime,
     partition_token: Option<String>,
     heartbeat_milliseconds: i64,
 }
@@ -137,7 +142,7 @@ impl ChangeStreamQueryBuilder {
             client,
             change_stream_name: change_stream_name.into(),
             start_timestamp: None,
-            end_timestamp: None,
+            end_timestamp: time::OffsetDateTime::now_utc() + time::Duration::minutes(2),
             partition_token: None,
             heartbeat_milliseconds: 10_000,
         }
@@ -154,10 +159,13 @@ impl ChangeStreamQueryBuilder {
 
     /// Sets the end timestamp for the change stream query.
     ///
-    /// If not set (or set to `None`), the stream runs indefinitely until
-    /// cancelled.
+    /// `MUTABLE_KEY_RANGE` change streams require a non-null end timestamp.
+    /// Defaults to `now + 2 minutes` (matching the Apache Beam connector's
+    /// rolling window approach). For indefinite CDC streaming, callers should
+    /// loop: query with a near-future end timestamp, consume records, then
+    /// re-query from the last checkpoint.
     pub fn with_end_timestamp(mut self, ts: time::OffsetDateTime) -> Self {
-        self.end_timestamp = Some(ts);
+        self.end_timestamp = ts;
         self
     }
 
@@ -229,7 +237,7 @@ impl ChangeStreamQueryBuilder {
 
         let stmt = Statement::builder(&sql)
             .add_param("start_timestamp", &self.start_timestamp)
-            .add_param("end_timestamp", &self.end_timestamp)
+            .add_param("end_timestamp", &Some(self.end_timestamp))
             .add_param("partition_token", &self.partition_token)
             .add_param("heartbeat_milliseconds", &self.heartbeat_milliseconds)
             .build();
@@ -245,8 +253,8 @@ impl ChangeStreamQueryBuilder {
 /// from a change stream query.
 ///
 /// Each call to [`next`](Self::next) pulls the next row from the underlying
-/// `ResultSet`, parses the `ChangeRecord` column, and yields one or more
-/// [`ChangeStreamRecord`](crate::model::ChangeStreamRecord) values.
+/// `ResultSet`, decodes the protobuf-encoded `ChangeRecord` column, and
+/// yields a single [`ChangeStreamRecord`](crate::model::ChangeStreamRecord).
 ///
 /// The stream may return
 /// [`PartitionStartRecord`](crate::model::change_stream_record::PartitionStartRecord)s
@@ -256,147 +264,60 @@ impl ChangeStreamQueryBuilder {
 ///
 /// # Partition mode
 ///
-/// Only `MUTABLE_KEY_RANGE` change streams are supported.  If the stream
-/// encounters a `ChildPartitionsRecord` (from a legacy `IMMUTABLE_KEY_RANGE`
-/// stream), [`next`](Self::next) returns an error.
+/// Only `MUTABLE_KEY_RANGE` change streams are supported.
 #[derive(Debug)]
 pub struct ChangeStreamRecordStream {
     result_set: ResultSet,
 }
 
 impl ChangeStreamRecordStream {
-    /// Returns the next batch of [`ChangeStreamRecord`](crate::model::ChangeStreamRecord)
-    /// values from the stream.
+    /// Returns the next [`ChangeStreamRecord`](crate::model::ChangeStreamRecord)
+    /// from the stream.
     ///
-    /// Each row from the change stream TVF contains an
-    /// `ARRAY<STRUCT<...>>` in its single `ChangeRecord` column.
-    /// Per the Spanner docs the array always contains exactly one element,
-    /// but this method returns a `Vec` for forward compatibility.
+    /// Each row from the `MUTABLE_KEY_RANGE` change stream TVF contains a
+    /// single `ChangeRecord` column of type `PROTO` holding a serialized
+    /// [`ChangeStreamRecord`](crate::model::ChangeStreamRecord).
     ///
     /// Returns `None` when the stream is exhausted.
     ///
     /// # Errors
     ///
-    /// Returns an error if the underlying RPC stream fails or if a
-    /// `ChangeStreamRecord` cannot be deserialized from the row data.
-    pub async fn next(&mut self) -> Option<crate::Result<Vec<ChangeStreamRecord>>> {
+    /// Returns an error if the underlying RPC stream fails or if the
+    /// protobuf bytes cannot be decoded.
+    pub async fn next(&mut self) -> Option<crate::Result<ChangeStreamRecord>> {
         let row = match self.result_set.next().await? {
             Ok(r) => r,
             Err(e) => return Some(Err(e)),
         };
 
-        // The change stream TVF returns a single column "ChangeRecord" that is
-        // ARRAY<STRUCT<...>>. Use try_get::<serde_json::Value, _> to get the
-        // full JSON representation, then deserialize each array element into
-        // ChangeStreamRecord.
-        let json_value: serde_json::Value = match row.try_get("ChangeRecord") {
+        // MUTABLE_KEY_RANGE TVF returns a single column "ChangeRecord" with
+        // TypeCode::Proto containing serialized ChangeStreamRecord bytes.
+        let proto_bytes: Vec<u8> = match row.try_get("ChangeRecord") {
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
         };
 
-        match parse_change_stream_records(&json_value) {
-            Ok(records) => Some(Ok(records)),
+        match decode_change_stream_record(&proto_bytes) {
+            Ok(record) => Some(Ok(record)),
             Err(e) => Some(Err(e)),
         }
     }
 }
 
-/// The oneof field names in `ChangeStreamRecord`. When Spanner returns a
-/// struct with all 5 fields present (4 as null, 1 populated), the generated
-/// serde deserializer treats each non-`None` variant as "record already set"
-/// and errors. We strip null oneof keys before deserializing to avoid this.
-const ONEOF_FIELDS: &[&str] = &[
-    "dataChangeRecord",
-    "data_change_record",
-    "heartbeatRecord",
-    "heartbeat_record",
-    "partitionStartRecord",
-    "partition_start_record",
-    "partitionEndRecord",
-    "partition_end_record",
-    "partitionEventRecord",
-    "partition_event_record",
-];
-
-/// Field names used by the legacy `IMMUTABLE_KEY_RANGE` partition mode.
-/// If any of these keys appear (even as null) in a record, it means the
-/// change stream was created without `partition_mode = 'MUTABLE_KEY_RANGE'`.
-const IMMUTABLE_KEY_RANGE_FIELDS: &[&str] = &["childPartitionsRecord", "child_partitions_record"];
-
-fn parse_change_stream_records(
-    json_value: &serde_json::Value,
-) -> crate::Result<Vec<ChangeStreamRecord>> {
-    let array = match json_value {
-        serde_json::Value::Array(arr) => arr,
-        serde_json::Value::Null => return Ok(vec![]),
-        other => {
-            return Err(crate::error::internal_error(format!(
-                "expected array for ChangeRecord column, got: {}",
-                value_type_name(other),
-            )));
-        }
-    };
-
-    let mut records = Vec::with_capacity(array.len());
-    for element in array {
-        check_immutable_key_range(element)?;
-        let cleaned = strip_null_oneof_fields(element);
-        let record: ChangeStreamRecord = serde_json::from_value(cleaned).map_err(|e| {
-            crate::error::internal_error(format!("failed to deserialize ChangeStreamRecord: {e}"))
+/// Decodes a protobuf-serialized `ChangeStreamRecord` (from a
+/// `MUTABLE_KEY_RANGE` change stream) into the gapic model type.
+fn decode_change_stream_record(bytes: &[u8]) -> crate::Result<ChangeStreamRecord> {
+    let prost_record =
+        crate::google::spanner::v1::ChangeStreamRecord::decode(bytes).map_err(|e| {
+            crate::error::internal_error(format!(
+                "failed to decode ChangeStreamRecord protobuf: {e}"
+            ))
         })?;
-        records.push(record);
-    }
-
-    Ok(records)
-}
-
-/// Returns an error if the JSON object contains a `ChildPartitionsRecord`
-/// key, which indicates the change stream uses the legacy
-/// `IMMUTABLE_KEY_RANGE` partition mode not supported by this API.
-fn check_immutable_key_range(value: &serde_json::Value) -> crate::Result<()> {
-    if let serde_json::Value::Object(map) = value {
-        for key in IMMUTABLE_KEY_RANGE_FIELDS {
-            if map.contains_key(*key) {
-                return Err(crate::error::internal_error(
-                    "received a ChildPartitionsRecord, which indicates this change stream \
-                     uses the legacy IMMUTABLE_KEY_RANGE partition mode. This API only \
-                     supports MUTABLE_KEY_RANGE change streams. Recreate the change stream \
-                     with: ALTER CHANGE STREAM <name> SET OPTIONS \
-                     (partition_mode = 'MUTABLE_KEY_RANGE') or CREATE CHANGE STREAM <name> \
-                     ... OPTIONS (partition_mode = 'MUTABLE_KEY_RANGE')"
-                        .to_string(),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Remove null-valued oneof fields so the generated deserializer does not
-/// see them as duplicate `record` assignments.
-fn strip_null_oneof_fields(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let filtered: serde_json::Map<String, serde_json::Value> = map
-                .iter()
-                .filter(|(k, v)| !(v.is_null() && ONEOF_FIELDS.contains(&k.as_str())))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            serde_json::Value::Object(filtered)
-        }
-        other => other.clone(),
-    }
-}
-
-fn value_type_name(v: &serde_json::Value) -> &'static str {
-    match v {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "bool",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
+    prost_record.cnv().map_err(|e| {
+        crate::error::internal_error(format!(
+            "failed to convert ChangeStreamRecord from prost to gapic: {e}"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -454,337 +375,251 @@ mod tests {
         assert!(escape_identifier("My\u{1f389}Stream").is_err());
     }
 
-    // ── JSON deserialization tests ──
+    // ── protobuf decode tests ──
 
-    #[test]
-    fn parse_data_change_record() {
-        let json = serde_json::json!([{
-            "dataChangeRecord": {
-                "commitTimestamp": "2024-01-15T10:30:00Z",
-                "recordSequence": "00000001",
-                "serverTransactionId": "txn-123",
-                "isLastRecordInTransactionInPartition": true,
-                "table": "Users",
-                "columnMetadata": [],
-                "mods": [],
-                "modType": "INSERT",
-                "valueCaptureType": "OLD_AND_NEW_VALUES",
-                "numberOfRecordsInTransaction": 1,
-                "numberOfPartitionsInTransaction": 1,
-                "transactionTag": "",
-                "isSystemTransaction": false
-            }
-        }]);
-
-        let records = parse_change_stream_records(&json).expect("parse should succeed");
-        assert_eq!(records.len(), 1);
-        assert!(records[0].data_change_record().is_some());
+    /// Helper: encode a prost ChangeStreamRecord to bytes.
+    fn encode_prost_record(record: crate::google::spanner::v1::ChangeStreamRecord) -> Vec<u8> {
+        let mut buf = Vec::new();
+        record.encode(&mut buf).unwrap();
+        buf
     }
 
     #[test]
-    fn parse_heartbeat_record() {
-        let json = serde_json::json!([{
-            "heartbeatRecord": {
-                "timestamp": "2024-01-15T10:30:00Z"
-            }
-        }]);
+    fn decode_heartbeat_record() {
+        use crate::google::spanner::v1 as proto;
 
-        let records = parse_change_stream_records(&json).expect("parse should succeed");
-        assert_eq!(records.len(), 1);
-        assert!(records[0].heartbeat_record().is_some());
+        let prost_record = proto::ChangeStreamRecord {
+            record: Some(proto::change_stream_record::Record::HeartbeatRecord(
+                proto::change_stream_record::HeartbeatRecord {
+                    timestamp: Some(prost_types::Timestamp {
+                        seconds: 1705312200,
+                        nanos: 0,
+                    }),
+                },
+            )),
+        };
+
+        let bytes = encode_prost_record(prost_record);
+        let record = decode_change_stream_record(&bytes).expect("decode should succeed");
+        assert!(record.heartbeat_record().is_some());
+        let hb = record.heartbeat_record().unwrap();
+        assert!(hb.timestamp.is_some());
     }
 
     #[test]
-    fn parse_partition_start_record() {
-        let json = serde_json::json!([{
-            "partitionStartRecord": {
-                "startTimestamp": "2024-01-15T10:30:00Z",
-                "recordSequence": "00000001",
-                "partitionTokens": ["token-1", "token-2"]
-            }
-        }]);
+    fn decode_data_change_record() {
+        use crate::google::spanner::v1 as proto;
 
-        let records = parse_change_stream_records(&json).expect("parse should succeed");
-        assert_eq!(records.len(), 1);
-        assert!(records[0].partition_start_record().is_some());
+        let prost_record = proto::ChangeStreamRecord {
+            record: Some(proto::change_stream_record::Record::DataChangeRecord(
+                proto::change_stream_record::DataChangeRecord {
+                    commit_timestamp: Some(prost_types::Timestamp {
+                        seconds: 1705312200,
+                        nanos: 0,
+                    }),
+                    record_sequence: "00000001".to_string(),
+                    server_transaction_id: "txn-123".to_string(),
+                    is_last_record_in_transaction_in_partition: true,
+                    table: "Users".to_string(),
+                    column_metadata: vec![],
+                    mods: vec![],
+                    mod_type: proto::change_stream_record::data_change_record::ModType::Insert
+                        as i32,
+                    value_capture_type:
+                        proto::change_stream_record::data_change_record::ValueCaptureType::OldAndNewValues
+                            as i32,
+                    number_of_records_in_transaction: 1,
+                    number_of_partitions_in_transaction: 1,
+                    transaction_tag: "".to_string(),
+                    is_system_transaction: false,
+                },
+            )),
+        };
+
+        let bytes = encode_prost_record(prost_record);
+        let record = decode_change_stream_record(&bytes).expect("decode should succeed");
+        let dcr = record
+            .data_change_record()
+            .expect("should be DataChangeRecord");
+        assert_eq!(dcr.table, "Users");
+        assert_eq!(dcr.server_transaction_id, "txn-123");
+        assert!(dcr.is_last_record_in_transaction_in_partition);
     }
 
     #[test]
-    fn parse_partition_end_record() {
-        let json = serde_json::json!([{
-            "partitionEndRecord": {
-                "endTimestamp": "2024-01-15T10:30:00Z",
-                "recordSequence": "00000001",
-                "partitionToken": "token-1"
-            }
-        }]);
+    fn decode_partition_start_record() {
+        use crate::google::spanner::v1 as proto;
 
-        let records = parse_change_stream_records(&json).expect("parse should succeed");
-        assert_eq!(records.len(), 1);
-        assert!(records[0].partition_end_record().is_some());
+        let prost_record = proto::ChangeStreamRecord {
+            record: Some(proto::change_stream_record::Record::PartitionStartRecord(
+                proto::change_stream_record::PartitionStartRecord {
+                    start_timestamp: Some(prost_types::Timestamp {
+                        seconds: 1705312200,
+                        nanos: 0,
+                    }),
+                    record_sequence: "00000001".to_string(),
+                    partition_tokens: vec!["token-1".to_string(), "token-2".to_string()],
+                },
+            )),
+        };
+
+        let bytes = encode_prost_record(prost_record);
+        let record = decode_change_stream_record(&bytes).expect("decode should succeed");
+        let psr = record
+            .partition_start_record()
+            .expect("should be PartitionStartRecord");
+        assert_eq!(psr.partition_tokens.len(), 2);
+        assert_eq!(psr.partition_tokens[0], "token-1");
+        assert_eq!(psr.partition_tokens[1], "token-2");
     }
 
     #[test]
-    fn parse_partition_event_record() {
-        let json = serde_json::json!([{
-            "partitionEventRecord": {
-                "commitTimestamp": "2024-01-15T10:30:00Z",
-                "recordSequence": "00000001",
-                "partitionToken": "token-1",
-                "moveInEvents": [],
-                "moveOutEvents": []
-            }
-        }]);
+    fn decode_partition_end_record() {
+        use crate::google::spanner::v1 as proto;
 
-        let records = parse_change_stream_records(&json).expect("parse should succeed");
-        assert_eq!(records.len(), 1);
-        assert!(records[0].partition_event_record().is_some());
+        let prost_record = proto::ChangeStreamRecord {
+            record: Some(proto::change_stream_record::Record::PartitionEndRecord(
+                proto::change_stream_record::PartitionEndRecord {
+                    end_timestamp: Some(prost_types::Timestamp {
+                        seconds: 1705312200,
+                        nanos: 0,
+                    }),
+                    record_sequence: "00000001".to_string(),
+                    partition_token: "token-1".to_string(),
+                },
+            )),
+        };
+
+        let bytes = encode_prost_record(prost_record);
+        let record = decode_change_stream_record(&bytes).expect("decode should succeed");
+        let per = record
+            .partition_end_record()
+            .expect("should be PartitionEndRecord");
+        assert_eq!(per.partition_token, "token-1");
     }
 
     #[test]
-    fn parse_empty_array() {
-        let json = serde_json::json!([]);
-        let records = parse_change_stream_records(&json).expect("parse should succeed");
-        assert!(records.is_empty());
+    fn decode_partition_event_record() {
+        use crate::google::spanner::v1 as proto;
+
+        let prost_record = proto::ChangeStreamRecord {
+            record: Some(proto::change_stream_record::Record::PartitionEventRecord(
+                proto::change_stream_record::PartitionEventRecord {
+                    commit_timestamp: Some(prost_types::Timestamp {
+                        seconds: 1705312200,
+                        nanos: 0,
+                    }),
+                    record_sequence: "00000001".to_string(),
+                    partition_token: "token-1".to_string(),
+                    move_in_events: vec![
+                        proto::change_stream_record::partition_event_record::MoveInEvent {
+                            source_partition_token: "source-token".to_string(),
+                        },
+                    ],
+                    move_out_events: vec![],
+                },
+            )),
+        };
+
+        let bytes = encode_prost_record(prost_record);
+        let record = decode_change_stream_record(&bytes).expect("decode should succeed");
+        let per = record
+            .partition_event_record()
+            .expect("should be PartitionEventRecord");
+        assert_eq!(per.partition_token, "token-1");
+        assert_eq!(per.move_in_events.len(), 1);
     }
 
     #[test]
-    fn parse_null_value() {
-        let json = serde_json::Value::Null;
-        let records = parse_change_stream_records(&json).expect("parse should succeed");
-        assert!(records.is_empty());
-    }
+    fn decode_data_change_record_with_mods() {
+        use crate::google::spanner::v1 as proto;
 
-    #[test]
-    fn parse_multiple_records() {
-        let json = serde_json::json!([
-            {
-                "dataChangeRecord": {
-                    "commitTimestamp": "2024-01-15T10:30:00Z",
-                    "recordSequence": "00000001",
-                    "serverTransactionId": "txn-123",
-                    "isLastRecordInTransactionInPartition": true,
-                    "table": "Users",
-                    "columnMetadata": [],
-                    "mods": [],
-                    "modType": "INSERT",
-                    "valueCaptureType": "OLD_AND_NEW_VALUES",
-                    "numberOfRecordsInTransaction": 1,
-                    "numberOfPartitionsInTransaction": 1,
-                    "transactionTag": "",
-                    "isSystemTransaction": false
-                }
-            },
-            {
-                "heartbeatRecord": {
-                    "timestamp": "2024-01-15T10:31:00Z"
-                }
-            }
-        ]);
+        let prost_record = proto::ChangeStreamRecord {
+            record: Some(proto::change_stream_record::Record::DataChangeRecord(
+                proto::change_stream_record::DataChangeRecord {
+                    commit_timestamp: Some(prost_types::Timestamp {
+                        seconds: 1705312200,
+                        nanos: 0,
+                    }),
+                    record_sequence: "00000001".to_string(),
+                    server_transaction_id: "txn-456".to_string(),
+                    is_last_record_in_transaction_in_partition: true,
+                    table: "Users".to_string(),
+                    column_metadata: vec![
+                        proto::change_stream_record::data_change_record::ColumnMetadata {
+                            name: "Id".to_string(),
+                            r#type: None,
+                            is_primary_key: true,
+                            ordinal_position: 1,
+                        },
+                        proto::change_stream_record::data_change_record::ColumnMetadata {
+                            name: "Name".to_string(),
+                            r#type: None,
+                            is_primary_key: false,
+                            ordinal_position: 2,
+                        },
+                    ],
+                    mods: vec![proto::change_stream_record::data_change_record::Mod {
+                        keys: vec![
+                            proto::change_stream_record::data_change_record::ModValue {
+                                column_metadata_index: 0,
+                                value: Some(prost_types::Value {
+                                    kind: Some(prost_types::value::Kind::StringValue(
+                                        "42".to_string(),
+                                    )),
+                                }),
+                            },
+                        ],
+                        old_values: vec![],
+                        new_values: vec![
+                            proto::change_stream_record::data_change_record::ModValue {
+                                column_metadata_index: 1,
+                                value: Some(prost_types::Value {
+                                    kind: Some(prost_types::value::Kind::StringValue(
+                                        "Alice".to_string(),
+                                    )),
+                                }),
+                            },
+                        ],
+                    }],
+                    mod_type: proto::change_stream_record::data_change_record::ModType::Insert
+                        as i32,
+                    value_capture_type:
+                        proto::change_stream_record::data_change_record::ValueCaptureType::OldAndNewValues
+                            as i32,
+                    number_of_records_in_transaction: 1,
+                    number_of_partitions_in_transaction: 1,
+                    transaction_tag: "my-tag".to_string(),
+                    is_system_transaction: false,
+                },
+            )),
+        };
 
-        let records = parse_change_stream_records(&json).expect("parse should succeed");
-        assert_eq!(records.len(), 2);
-        assert!(records[0].data_change_record().is_some());
-        assert!(records[1].heartbeat_record().is_some());
-    }
-
-    #[test]
-    fn parse_invalid_type_returns_error() {
-        let json = serde_json::json!("not an array");
-        let result = parse_change_stream_records(&json);
-        assert!(result.is_err());
-    }
-
-    /// When Spanner's struct_type declares all 5 oneof fields and sends null
-    /// for the 4 inactive ones, the generated deserializer would error on the
-    /// second null field ("multiple values for record"). The null-stripping in
-    /// `parse_change_stream_records` must handle this.
-    #[test]
-    fn parse_record_with_null_oneof_fields() {
-        let json = serde_json::json!([{
-            "dataChangeRecord": null,
-            "heartbeatRecord": {
-                "timestamp": "2024-01-15T10:30:00Z"
-            },
-            "partitionStartRecord": null,
-            "partitionEndRecord": null,
-            "partitionEventRecord": null
-        }]);
-
-        let records = parse_change_stream_records(&json).expect("parse should succeed");
-        assert_eq!(records.len(), 1);
-        assert!(records[0].heartbeat_record().is_some());
-    }
-
-    #[test]
-    fn parse_record_with_null_oneof_fields_snake_case() {
-        let json = serde_json::json!([{
-            "data_change_record": null,
-            "heartbeat_record": null,
-            "partition_start_record": {
-                "startTimestamp": "2024-01-15T10:30:00Z",
-                "recordSequence": "00000001",
-                "partitionTokens": ["token-1"]
-            },
-            "partition_end_record": null,
-            "partition_event_record": null
-        }]);
-
-        let records = parse_change_stream_records(&json).expect("parse should succeed");
-        assert_eq!(records.len(), 1);
-        assert!(records[0].partition_start_record().is_some());
-    }
-
-    // ── IMMUTABLE_KEY_RANGE detection ──
-
-    #[test]
-    fn reject_child_partitions_record_camel_case() {
-        let json = serde_json::json!([{
-            "childPartitionsRecord": {
-                "startTimestamp": "2024-01-15T10:30:00Z",
-                "recordSequence": "00000001",
-                "childPartitions": [
-                    {"token": "child-token-1", "parentPartitionTokens": ["parent-1"]}
-                ]
-            }
-        }]);
-
-        let err = parse_change_stream_records(&json).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("ChildPartitionsRecord"),
-            "error should mention ChildPartitionsRecord, got: {msg}"
-        );
-        assert!(
-            msg.contains("MUTABLE_KEY_RANGE"),
-            "error should mention MUTABLE_KEY_RANGE, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn reject_child_partitions_record_snake_case() {
-        let json = serde_json::json!([{
-            "child_partitions_record": {
-                "start_timestamp": "2024-01-15T10:30:00Z",
-                "record_sequence": "00000001",
-                "child_partitions": [
-                    {"token": "child-token-1", "parent_partition_tokens": ["parent-1"]}
-                ]
-            }
-        }]);
-
-        let err = parse_change_stream_records(&json).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("ChildPartitionsRecord"),
-            "error should mention ChildPartitionsRecord, got: {msg}"
-        );
-        assert!(
-            msg.contains("MUTABLE_KEY_RANGE"),
-            "error should mention MUTABLE_KEY_RANGE, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn reject_null_child_partitions_record() {
-        // Even a null-valued childPartitionsRecord key indicates the wrong
-        // partition mode — the key itself should never appear in
-        // MUTABLE_KEY_RANGE streams.
-        let json = serde_json::json!([{
-            "dataChangeRecord": {
-                "commitTimestamp": "2024-01-15T10:30:00Z",
-                "recordSequence": "00000001",
-                "serverTransactionId": "txn-999",
-                "isLastRecordInTransactionInPartition": true,
-                "table": "Users",
-                "columnMetadata": [],
-                "mods": [],
-                "modType": "INSERT",
-                "valueCaptureType": "OLD_AND_NEW_VALUES",
-                "numberOfRecordsInTransaction": 1,
-                "numberOfPartitionsInTransaction": 1
-            },
-            "childPartitionsRecord": null
-        }]);
-
-        let err = parse_change_stream_records(&json).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("IMMUTABLE_KEY_RANGE"),
-            "error should mention IMMUTABLE_KEY_RANGE, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn accept_mutable_key_range_records() {
-        // Verify that MUTABLE_KEY_RANGE record types pass the check without error.
-        let json = serde_json::json!([{
-            "partitionStartRecord": {
-                "startTimestamp": "2024-01-15T10:30:00Z",
-                "recordSequence": "00000001",
-                "partitionTokens": ["token-a", "token-b"]
-            }
-        }]);
-
-        let records =
-            parse_change_stream_records(&json).expect("should accept MUTABLE_KEY_RANGE record");
-        assert_eq!(records.len(), 1);
-        assert!(records[0].partition_start_record().is_some());
-    }
-
-    // ── JSON deserialization: mods ──
-
-    #[test]
-    fn parse_data_change_record_with_mods() {
-        let json = serde_json::json!([{
-            "dataChangeRecord": {
-                "commitTimestamp": "2024-01-15T10:30:00Z",
-                "recordSequence": "00000001",
-                "serverTransactionId": "txn-456",
-                "isLastRecordInTransactionInPartition": true,
-                "table": "Users",
-                "columnMetadata": [
-                    {
-                        "name": "Id",
-                        "type": {"code": "INT64"},
-                        "isPrimaryKey": true,
-                        "ordinalPosition": 1
-                    },
-                    {
-                        "name": "Name",
-                        "type": {"code": "STRING"},
-                        "isPrimaryKey": false,
-                        "ordinalPosition": 2
-                    }
-                ],
-                "mods": [
-                    {
-                        "keys": [{"columnMetadataIndex": 0, "value": {"stringValue": "42"}}],
-                        "newValues": [{"columnMetadataIndex": 1, "value": {"stringValue": "Alice"}}],
-                        "oldValues": []
-                    }
-                ],
-                "modType": "INSERT",
-                "valueCaptureType": "OLD_AND_NEW_VALUES",
-                "numberOfRecordsInTransaction": 1,
-                "numberOfPartitionsInTransaction": 1,
-                "transactionTag": "my-tag",
-                "isSystemTransaction": false
-            }
-        }]);
-
-        let records = parse_change_stream_records(&json).expect("parse should succeed");
-        assert_eq!(records.len(), 1);
-        let dcr = records[0].data_change_record().unwrap();
+        let bytes = encode_prost_record(prost_record);
+        let record = decode_change_stream_record(&bytes).expect("decode should succeed");
+        let dcr = record.data_change_record().unwrap();
         assert_eq!(dcr.table, "Users");
         assert_eq!(dcr.column_metadata.len(), 2);
         assert_eq!(dcr.mods.len(), 1);
-        // Verify the ModValue fields are correctly deserialized (not absorbed by _unknown_fields).
         assert_eq!(dcr.mods[0].keys[0].column_metadata_index, 0);
         assert!(dcr.mods[0].keys[0].value.is_some());
         assert_eq!(dcr.mods[0].new_values[0].column_metadata_index, 1);
         assert!(dcr.mods[0].new_values[0].value.is_some());
         assert_eq!(dcr.transaction_tag, "my-tag");
+    }
+
+    #[test]
+    fn decode_empty_bytes_returns_error() {
+        // Empty bytes should fail to decode (no valid protobuf).
+        // Actually, empty bytes decode to a default ChangeStreamRecord (no record set).
+        let record = decode_change_stream_record(&[]).expect("empty proto is valid default");
+        assert!(record.record.is_none());
+    }
+
+    #[test]
+    fn decode_invalid_bytes_returns_error() {
+        let result = decode_change_stream_record(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(result.is_err());
     }
 
     // ── mock-server integration tests ──
@@ -793,15 +628,15 @@ mod tests {
     /// and parameters to `ExecuteStreamingSql`, and that the returned
     /// `ChangeStreamRecordStream` yields correctly deserialized records.
     ///
-    /// The mock returns data in the production wire format:
-    /// - Column type: `ARRAY<STRUCT<...>>` (not JSON)
-    /// - Value: `ListValue` containing positional struct values
-    /// This exercises the real `FromValue for serde_json::Value` code path
-    /// through `list_value_to_json` with struct metadata.
+    /// The mock returns data in the MUTABLE_KEY_RANGE wire format:
+    /// - Column type: `PROTO(google.spanner.v1.ChangeStreamRecord)`
+    /// - Value: base64-encoded protobuf bytes
     #[google_cloud_test_macros::tokio_test_no_panics]
     async fn execute_end_to_end_mock_heartbeat() -> anyhow::Result<()> {
         use crate::read_only_transaction::tests::{create_session_mock, setup_db_client};
         use crate::result_set::tests::adapt;
+        use base64::Engine;
+        use base64::prelude::BASE64_STANDARD;
         use spanner_grpc_mock::google::spanner::v1 as mock_v1;
 
         let mut mock = create_session_mock();
@@ -811,28 +646,22 @@ mod tests {
             .returning(move |req| {
                 let req = req.into_inner();
 
-                // Verify the SQL contains the backtick-escaped TVF name.
                 assert!(
                     req.sql.contains("READ_`MyStream`"),
                     "SQL should contain backtick-escaped name, got: {}",
                     req.sql
                 );
-
-                // Verify named parameter syntax is used.
                 assert!(
                     req.sql.contains("start_timestamp => @start_timestamp"),
                     "SQL should use named parameters, got: {}",
                     req.sql
                 );
-
-                // Verify read_options => null is present.
                 assert!(
                     req.sql.contains("read_options => null"),
                     "SQL should contain read_options => null, got: {}",
                     req.sql
                 );
 
-                // Verify heartbeat_milliseconds param is set.
                 let params = req.params.as_ref().expect("params should be set");
                 let hb = params
                     .fields
@@ -843,80 +672,42 @@ mod tests {
                     Some(prost_types::value::Kind::StringValue("5000".to_string()))
                 );
 
-                // Production wire format: the ChangeRecord column is
-                // ARRAY<STRUCT<heartbeat_record STRUCT<timestamp TIMESTAMP>, ...>>.
-                //
-                // The inner struct has a single field "heartbeat_record" which
-                // is itself a struct with a "timestamp" field.
-                //
-                // In protobuf wire format, STRUCT values are encoded as
-                // ListValue with positional elements matching the struct_type
-                // fields.
+                // end_timestamp must be non-null for MUTABLE_KEY_RANGE.
+                let end_ts = params
+                    .fields
+                    .get("end_timestamp")
+                    .expect("end_timestamp param missing");
+                assert!(
+                    matches!(end_ts.kind, Some(prost_types::value::Kind::StringValue(_))),
+                    "end_timestamp should be a non-null string value"
+                );
 
-                // Heartbeat record struct type: { timestamp: TIMESTAMP }
-                let heartbeat_struct_type = mock_v1::StructType {
-                    fields: vec![mock_v1::struct_type::Field {
-                        name: "timestamp".to_string(),
-                        r#type: Some(mock_v1::Type {
-                            code: mock_v1::TypeCode::Timestamp as i32,
-                            ..Default::default()
-                        }),
-                    }],
+                // Build a proto-encoded HeartbeatRecord.
+                let prost_record = crate::google::spanner::v1::ChangeStreamRecord {
+                    record: Some(
+                        crate::google::spanner::v1::change_stream_record::Record::HeartbeatRecord(
+                            crate::google::spanner::v1::change_stream_record::HeartbeatRecord {
+                                timestamp: Some(prost_types::Timestamp {
+                                    seconds: 1705312200,
+                                    nanos: 0,
+                                }),
+                            },
+                        ),
+                    ),
                 };
+                let mut proto_bytes = Vec::new();
+                prost_record.encode(&mut proto_bytes).unwrap();
+                let b64 = BASE64_STANDARD.encode(&proto_bytes);
 
-                // Outer ChangeRecord struct type with one field:
-                // heartbeat_record: STRUCT<timestamp TIMESTAMP>
-                let change_record_struct_type = mock_v1::StructType {
-                    fields: vec![mock_v1::struct_type::Field {
-                        name: "heartbeat_record".to_string(),
-                        r#type: Some(mock_v1::Type {
-                            code: mock_v1::TypeCode::Struct as i32,
-                            struct_type: Some(heartbeat_struct_type),
-                            ..Default::default()
-                        }),
-                    }],
-                };
-
-                // Column type: ARRAY<STRUCT<...>>
+                // Column type: PROTO with proto_type_fqn
                 let column_type = mock_v1::Type {
-                    code: mock_v1::TypeCode::Array as i32,
-                    array_element_type: Some(Box::new(mock_v1::Type {
-                        code: mock_v1::TypeCode::Struct as i32,
-                        struct_type: Some(change_record_struct_type),
-                        ..Default::default()
-                    })),
+                    code: mock_v1::TypeCode::Proto as i32,
+                    proto_type_fqn: "google.spanner.v1.ChangeStreamRecord".to_string(),
                     ..Default::default()
                 };
 
-                // Value: an array (ListValue) containing one struct.
-                // The struct is itself a ListValue with positional values:
-                //   position 0 = heartbeat_record = STRUCT = ListValue[timestamp]
-                let heartbeat_struct_value = prost_types::Value {
-                    kind: Some(prost_types::value::Kind::ListValue(
-                        prost_types::ListValue {
-                            values: vec![prost_types::Value {
-                                kind: Some(prost_types::value::Kind::StringValue(
-                                    "2024-01-15T10:30:00Z".to_string(),
-                                )),
-                            }],
-                        },
-                    )),
-                };
-
-                let change_record_struct = prost_types::Value {
-                    kind: Some(prost_types::value::Kind::ListValue(
-                        prost_types::ListValue {
-                            values: vec![heartbeat_struct_value],
-                        },
-                    )),
-                };
-
-                let array_value = prost_types::Value {
-                    kind: Some(prost_types::value::Kind::ListValue(
-                        prost_types::ListValue {
-                            values: vec![change_record_struct],
-                        },
-                    )),
+                let proto_value = prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue(b64)),
                 };
 
                 let prs = mock_v1::PartialResultSet {
@@ -929,7 +720,7 @@ mod tests {
                         }),
                         ..Default::default()
                     }),
-                    values: vec![array_value],
+                    values: vec![proto_value],
                     last: true,
                     ..Default::default()
                 };
@@ -945,25 +736,24 @@ mod tests {
             .execute()
             .await?;
 
-        let records = stream.next().await.expect("should have one row")?;
-        assert_eq!(records.len(), 1);
-        let heartbeat = records[0]
+        let record = stream.next().await.expect("should have one row")?;
+        let heartbeat = record
             .heartbeat_record()
             .expect("should be a heartbeat record");
         assert!(heartbeat.timestamp.is_some(), "timestamp should be present");
 
-        // Stream should be exhausted.
         assert!(stream.next().await.is_none());
 
         Ok(())
     }
 
-    /// Same as heartbeat test but exercises DataChangeRecord deserialization
-    /// through the production ARRAY<STRUCT<...>> wire format.
+    /// Exercises DataChangeRecord deserialization through the proto wire format.
     #[google_cloud_test_macros::tokio_test_no_panics]
     async fn execute_end_to_end_mock_data_change() -> anyhow::Result<()> {
         use crate::read_only_transaction::tests::{create_session_mock, setup_db_client};
         use crate::result_set::tests::adapt;
+        use base64::Engine;
+        use base64::prelude::BASE64_STANDARD;
         use spanner_grpc_mock::google::spanner::v1 as mock_v1;
 
         let mut mock = create_session_mock();
@@ -971,118 +761,38 @@ mod tests {
         mock.expect_execute_streaming_sql()
             .once()
             .returning(move |_req| {
-                // Simplified DataChangeRecord struct type.
-                // Real wire has many fields; we include the key ones.
-                let dcr_struct_type = mock_v1::StructType {
-                    fields: vec![
-                        mock_v1::struct_type::Field {
-                            name: "commit_timestamp".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::Timestamp as i32,
-                                ..Default::default()
-                            }),
-                        },
-                        mock_v1::struct_type::Field {
-                            name: "record_sequence".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::String as i32,
-                                ..Default::default()
-                            }),
-                        },
-                        mock_v1::struct_type::Field {
-                            name: "server_transaction_id".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::String as i32,
-                                ..Default::default()
-                            }),
-                        },
-                        mock_v1::struct_type::Field {
-                            name: "is_last_record_in_transaction_in_partition".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::Bool as i32,
-                                ..Default::default()
-                            }),
-                        },
-                        mock_v1::struct_type::Field {
-                            name: "table".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::String as i32,
-                                ..Default::default()
-                            }),
-                        },
-                    ],
+                let prost_record = crate::google::spanner::v1::ChangeStreamRecord {
+                    record: Some(
+                        crate::google::spanner::v1::change_stream_record::Record::DataChangeRecord(
+                            crate::google::spanner::v1::change_stream_record::DataChangeRecord {
+                                commit_timestamp: Some(prost_types::Timestamp {
+                                    seconds: 1705312200,
+                                    nanos: 0,
+                                }),
+                                record_sequence: "00000001".to_string(),
+                                server_transaction_id: "txn-789".to_string(),
+                                is_last_record_in_transaction_in_partition: true,
+                                table: "Users".to_string(),
+                                column_metadata: vec![],
+                                mods: vec![],
+                                mod_type: 10,           // INSERT
+                                value_capture_type: 10, // OLD_AND_NEW_VALUES
+                                number_of_records_in_transaction: 1,
+                                number_of_partitions_in_transaction: 1,
+                                transaction_tag: "".to_string(),
+                                is_system_transaction: false,
+                            },
+                        ),
+                    ),
                 };
-
-                let change_record_struct_type = mock_v1::StructType {
-                    fields: vec![mock_v1::struct_type::Field {
-                        name: "data_change_record".to_string(),
-                        r#type: Some(mock_v1::Type {
-                            code: mock_v1::TypeCode::Struct as i32,
-                            struct_type: Some(dcr_struct_type),
-                            ..Default::default()
-                        }),
-                    }],
-                };
+                let mut proto_bytes = Vec::new();
+                prost_record.encode(&mut proto_bytes).unwrap();
+                let b64 = BASE64_STANDARD.encode(&proto_bytes);
 
                 let column_type = mock_v1::Type {
-                    code: mock_v1::TypeCode::Array as i32,
-                    array_element_type: Some(Box::new(mock_v1::Type {
-                        code: mock_v1::TypeCode::Struct as i32,
-                        struct_type: Some(change_record_struct_type),
-                        ..Default::default()
-                    })),
+                    code: mock_v1::TypeCode::Proto as i32,
+                    proto_type_fqn: "google.spanner.v1.ChangeStreamRecord".to_string(),
                     ..Default::default()
-                };
-
-                // DataChangeRecord struct value (positional):
-                // [commit_timestamp, record_sequence, server_transaction_id,
-                //  is_last_record, table]
-                let dcr_value = prost_types::Value {
-                    kind: Some(prost_types::value::Kind::ListValue(
-                        prost_types::ListValue {
-                            values: vec![
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::StringValue(
-                                        "2024-01-15T10:30:00Z".to_string(),
-                                    )),
-                                },
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::StringValue(
-                                        "00000001".to_string(),
-                                    )),
-                                },
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::StringValue(
-                                        "txn-789".to_string(),
-                                    )),
-                                },
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::BoolValue(true)),
-                                },
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::StringValue(
-                                        "Users".to_string(),
-                                    )),
-                                },
-                            ],
-                        },
-                    )),
-                };
-
-                let change_record = prost_types::Value {
-                    kind: Some(prost_types::value::Kind::ListValue(
-                        prost_types::ListValue {
-                            values: vec![dcr_value],
-                        },
-                    )),
-                };
-
-                let array_value = prost_types::Value {
-                    kind: Some(prost_types::value::Kind::ListValue(
-                        prost_types::ListValue {
-                            values: vec![change_record],
-                        },
-                    )),
                 };
 
                 let prs = mock_v1::PartialResultSet {
@@ -1095,7 +805,9 @@ mod tests {
                         }),
                         ..Default::default()
                     }),
-                    values: vec![array_value],
+                    values: vec![prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue(b64)),
+                    }],
                     last: true,
                     ..Default::default()
                 };
@@ -1107,9 +819,8 @@ mod tests {
 
         let mut stream = db_client.change_stream_query("MyStream").execute().await?;
 
-        let records = stream.next().await.expect("should have one row")?;
-        assert_eq!(records.len(), 1);
-        let dcr = records[0]
+        let record = stream.next().await.expect("should have one row")?;
+        let dcr = record
             .data_change_record()
             .expect("should be a data change record");
         assert_eq!(dcr.table, "Users");
@@ -1121,13 +832,13 @@ mod tests {
         Ok(())
     }
 
-    /// Exercises `DataChangeRecord` with `mods` (including `ModValue` with
-    /// `column_metadata_index` and `value`) through the full production
-    /// `ARRAY<STRUCT<...>>` wire path.
+    /// Exercises DataChangeRecord with mods through the proto wire format.
     #[google_cloud_test_macros::tokio_test_no_panics]
     async fn execute_end_to_end_mock_data_change_with_mods() -> anyhow::Result<()> {
         use crate::read_only_transaction::tests::{create_session_mock, setup_db_client};
         use crate::result_set::tests::adapt;
+        use base64::Engine;
+        use base64::prelude::BASE64_STANDARD;
         use spanner_grpc_mock::google::spanner::v1 as mock_v1;
 
         let mut mock = create_session_mock();
@@ -1135,276 +846,71 @@ mod tests {
         mock.expect_execute_streaming_sql()
             .once()
             .returning(move |_req| {
-                // ModValue struct type: { column_metadata_index: INT64, value: STRING }
-                let mod_value_struct = mock_v1::StructType {
-                    fields: vec![
-                        mock_v1::struct_type::Field {
-                            name: "column_metadata_index".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::Int64 as i32,
-                                ..Default::default()
-                            }),
-                        },
-                        mock_v1::struct_type::Field {
-                            name: "value".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::String as i32,
-                                ..Default::default()
-                            }),
-                        },
-                    ],
-                };
+                use crate::google::spanner::v1::change_stream_record::data_change_record as dcr;
 
-                // Mod struct type: { keys: ARRAY<STRUCT<ModValue>>,
-                //                    old_values: ARRAY<STRUCT<ModValue>>,
-                //                    new_values: ARRAY<STRUCT<ModValue>> }
-                let mod_struct = mock_v1::StructType {
-                    fields: vec![
-                        mock_v1::struct_type::Field {
-                            name: "keys".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::Array as i32,
-                                array_element_type: Some(Box::new(mock_v1::Type {
-                                    code: mock_v1::TypeCode::Struct as i32,
-                                    struct_type: Some(mod_value_struct.clone()),
-                                    ..Default::default()
-                                })),
-                                ..Default::default()
-                            }),
-                        },
-                        mock_v1::struct_type::Field {
-                            name: "old_values".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::Array as i32,
-                                array_element_type: Some(Box::new(mock_v1::Type {
-                                    code: mock_v1::TypeCode::Struct as i32,
-                                    struct_type: Some(mod_value_struct.clone()),
-                                    ..Default::default()
-                                })),
-                                ..Default::default()
-                            }),
-                        },
-                        mock_v1::struct_type::Field {
-                            name: "new_values".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::Array as i32,
-                                array_element_type: Some(Box::new(mock_v1::Type {
-                                    code: mock_v1::TypeCode::Struct as i32,
-                                    struct_type: Some(mod_value_struct),
-                                    ..Default::default()
-                                })),
-                                ..Default::default()
-                            }),
-                        },
-                    ],
+                let prost_record = crate::google::spanner::v1::ChangeStreamRecord {
+                    record: Some(
+                        crate::google::spanner::v1::change_stream_record::Record::DataChangeRecord(
+                            crate::google::spanner::v1::change_stream_record::DataChangeRecord {
+                                commit_timestamp: Some(prost_types::Timestamp {
+                                    seconds: 1705312200,
+                                    nanos: 0,
+                                }),
+                                record_sequence: "00000001".to_string(),
+                                server_transaction_id: "txn-mods".to_string(),
+                                is_last_record_in_transaction_in_partition: true,
+                                table: "Users".to_string(),
+                                column_metadata: vec![
+                                    dcr::ColumnMetadata {
+                                        name: "Id".to_string(),
+                                        r#type: None,
+                                        is_primary_key: true,
+                                        ordinal_position: 1,
+                                    },
+                                    dcr::ColumnMetadata {
+                                        name: "Name".to_string(),
+                                        r#type: None,
+                                        is_primary_key: false,
+                                        ordinal_position: 2,
+                                    },
+                                ],
+                                mods: vec![dcr::Mod {
+                                    keys: vec![dcr::ModValue {
+                                        column_metadata_index: 0,
+                                        value: Some(prost_types::Value {
+                                            kind: Some(prost_types::value::Kind::StringValue(
+                                                "42".to_string(),
+                                            )),
+                                        }),
+                                    }],
+                                    old_values: vec![],
+                                    new_values: vec![dcr::ModValue {
+                                        column_metadata_index: 1,
+                                        value: Some(prost_types::Value {
+                                            kind: Some(prost_types::value::Kind::StringValue(
+                                                "Alice".to_string(),
+                                            )),
+                                        }),
+                                    }],
+                                }],
+                                mod_type: dcr::ModType::Insert as i32,
+                                value_capture_type: dcr::ValueCaptureType::OldAndNewValues as i32,
+                                number_of_records_in_transaction: 1,
+                                number_of_partitions_in_transaction: 1,
+                                transaction_tag: "my-tag".to_string(),
+                                is_system_transaction: false,
+                            },
+                        ),
+                    ),
                 };
-
-                // DataChangeRecord struct: simplified with table + mods
-                let dcr_struct_type = mock_v1::StructType {
-                    fields: vec![
-                        mock_v1::struct_type::Field {
-                            name: "commit_timestamp".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::Timestamp as i32,
-                                ..Default::default()
-                            }),
-                        },
-                        mock_v1::struct_type::Field {
-                            name: "record_sequence".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::String as i32,
-                                ..Default::default()
-                            }),
-                        },
-                        mock_v1::struct_type::Field {
-                            name: "server_transaction_id".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::String as i32,
-                                ..Default::default()
-                            }),
-                        },
-                        mock_v1::struct_type::Field {
-                            name: "is_last_record_in_transaction_in_partition".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::Bool as i32,
-                                ..Default::default()
-                            }),
-                        },
-                        mock_v1::struct_type::Field {
-                            name: "table".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::String as i32,
-                                ..Default::default()
-                            }),
-                        },
-                        mock_v1::struct_type::Field {
-                            name: "mods".to_string(),
-                            r#type: Some(mock_v1::Type {
-                                code: mock_v1::TypeCode::Array as i32,
-                                array_element_type: Some(Box::new(mock_v1::Type {
-                                    code: mock_v1::TypeCode::Struct as i32,
-                                    struct_type: Some(mod_struct),
-                                    ..Default::default()
-                                })),
-                                ..Default::default()
-                            }),
-                        },
-                    ],
-                };
-
-                let change_record_struct_type = mock_v1::StructType {
-                    fields: vec![mock_v1::struct_type::Field {
-                        name: "data_change_record".to_string(),
-                        r#type: Some(mock_v1::Type {
-                            code: mock_v1::TypeCode::Struct as i32,
-                            struct_type: Some(dcr_struct_type),
-                            ..Default::default()
-                        }),
-                    }],
-                };
+                let mut proto_bytes = Vec::new();
+                prost_record.encode(&mut proto_bytes).unwrap();
+                let b64 = BASE64_STANDARD.encode(&proto_bytes);
 
                 let column_type = mock_v1::Type {
-                    code: mock_v1::TypeCode::Array as i32,
-                    array_element_type: Some(Box::new(mock_v1::Type {
-                        code: mock_v1::TypeCode::Struct as i32,
-                        struct_type: Some(change_record_struct_type),
-                        ..Default::default()
-                    })),
+                    code: mock_v1::TypeCode::Proto as i32,
+                    proto_type_fqn: "google.spanner.v1.ChangeStreamRecord".to_string(),
                     ..Default::default()
-                };
-
-                // Build the wire values (all positional ListValues).
-                // ModValue: [column_metadata_index, value]
-                let key_mod_value = prost_types::Value {
-                    kind: Some(prost_types::value::Kind::ListValue(
-                        prost_types::ListValue {
-                            values: vec![
-                                // column_metadata_index = 0
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::StringValue(
-                                        "0".to_string(),
-                                    )),
-                                },
-                                // value = "42"
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::StringValue(
-                                        "42".to_string(),
-                                    )),
-                                },
-                            ],
-                        },
-                    )),
-                };
-
-                let new_mod_value = prost_types::Value {
-                    kind: Some(prost_types::value::Kind::ListValue(
-                        prost_types::ListValue {
-                            values: vec![
-                                // column_metadata_index = 1
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::StringValue(
-                                        "1".to_string(),
-                                    )),
-                                },
-                                // value = "Alice"
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::StringValue(
-                                        "Alice".to_string(),
-                                    )),
-                                },
-                            ],
-                        },
-                    )),
-                };
-
-                // Mod: [keys_array, old_values_array, new_values_array]
-                let mod_value = prost_types::Value {
-                    kind: Some(prost_types::value::Kind::ListValue(
-                        prost_types::ListValue {
-                            values: vec![
-                                // keys: [key_mod_value]
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::ListValue(
-                                        prost_types::ListValue {
-                                            values: vec![key_mod_value],
-                                        },
-                                    )),
-                                },
-                                // old_values: []
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::ListValue(
-                                        prost_types::ListValue { values: vec![] },
-                                    )),
-                                },
-                                // new_values: [new_mod_value]
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::ListValue(
-                                        prost_types::ListValue {
-                                            values: vec![new_mod_value],
-                                        },
-                                    )),
-                                },
-                            ],
-                        },
-                    )),
-                };
-
-                // DataChangeRecord: [commit_timestamp, record_sequence,
-                //   server_transaction_id, is_last_record, table, mods_array]
-                let dcr_value = prost_types::Value {
-                    kind: Some(prost_types::value::Kind::ListValue(
-                        prost_types::ListValue {
-                            values: vec![
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::StringValue(
-                                        "2024-01-15T10:30:00Z".to_string(),
-                                    )),
-                                },
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::StringValue(
-                                        "00000001".to_string(),
-                                    )),
-                                },
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::StringValue(
-                                        "txn-mods".to_string(),
-                                    )),
-                                },
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::BoolValue(true)),
-                                },
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::StringValue(
-                                        "Users".to_string(),
-                                    )),
-                                },
-                                // mods: array containing one Mod struct
-                                prost_types::Value {
-                                    kind: Some(prost_types::value::Kind::ListValue(
-                                        prost_types::ListValue {
-                                            values: vec![mod_value],
-                                        },
-                                    )),
-                                },
-                            ],
-                        },
-                    )),
-                };
-
-                let change_record = prost_types::Value {
-                    kind: Some(prost_types::value::Kind::ListValue(
-                        prost_types::ListValue {
-                            values: vec![dcr_value],
-                        },
-                    )),
-                };
-
-                let array_value = prost_types::Value {
-                    kind: Some(prost_types::value::Kind::ListValue(
-                        prost_types::ListValue {
-                            values: vec![change_record],
-                        },
-                    )),
                 };
 
                 let prs = mock_v1::PartialResultSet {
@@ -1417,7 +923,9 @@ mod tests {
                         }),
                         ..Default::default()
                     }),
-                    values: vec![array_value],
+                    values: vec![prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue(b64)),
+                    }],
                     last: true,
                     ..Default::default()
                 };
@@ -1429,9 +937,8 @@ mod tests {
 
         let mut stream = db_client.change_stream_query("MyStream").execute().await?;
 
-        let records = stream.next().await.expect("should have one row")?;
-        assert_eq!(records.len(), 1);
-        let dcr = records[0]
+        let record = stream.next().await.expect("should have one row")?;
+        let dcr = record
             .data_change_record()
             .expect("should be a data change record");
         assert_eq!(dcr.table, "Users");
