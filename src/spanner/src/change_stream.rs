@@ -356,7 +356,26 @@ impl ChangeStreamQueryBuilder {
             .build();
 
         let tx = self.client.single_use().build();
-        let result_set = tx.execute_query(stmt).await?;
+        let result_set = match tx.execute_query(stmt).await {
+            Ok(rs) => rs,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("end_timestamp must not be null")
+                    || msg.contains("end_timestamp")
+                        && (msg.contains("null") || msg.contains("NULL"))
+                {
+                    return Err(crate::error::internal_error(format!(
+                        "{e}. This change stream likely uses MUTABLE_KEY_RANGE \
+                         partition mode, which requires a non-null end_timestamp. \
+                         Call .with_end_timestamp() on the builder before .execute(). \
+                         For indefinite CDC streaming, use a rolling window: \
+                         set end_timestamp to now + 2 minutes and re-query \
+                         from the last checkpoint when the stream ends."
+                    )));
+                }
+                return Err(e);
+            }
+        };
 
         Ok(ChangeStreamRecordStream {
             result_set,
