@@ -260,16 +260,16 @@ impl DatabaseClient {
     /// # Example
     /// ```no_run
     /// # use google_cloud_spanner::client::Spanner;
+    /// # use google_cloud_spanner::change_stream::ChangeStreamEntry;
     /// # async fn run(spanner: Spanner) -> Result<(), google_cloud_spanner::Error> {
     /// let db_client = spanner.database_client("projects/p/instances/i/databases/d").build().await?;
     /// let mut stream = db_client.change_stream_query("MyChangeStream")
     ///     .with_heartbeat_milliseconds(10_000)
     ///     .execute()
     ///     .await?;
-    /// while let Some(records) = stream.next().await {
-    ///     for record in records? {
-    ///         println!("{:?}", record);
-    ///     }
+    /// while let Some(entry) = stream.next().await {
+    ///     let entry = entry?;
+    ///     println!("{entry:?}");
     /// }
     /// # Ok(())
     /// # }
@@ -277,8 +277,8 @@ impl DatabaseClient {
     ///
     /// Builds and executes a change stream TVF query
     /// (`SELECT ChangeRecord FROM READ_<name>(...)`) via `ExecuteStreamingSql`,
-    /// returning a stream of fully-deserialized
-    /// [`ChangeStreamRecord`](crate::model::ChangeStreamRecord) values.
+    /// returning a stream of [`ChangeStreamEntry`](crate::change_stream::ChangeStreamEntry)
+    /// values. See the [`change_stream`](crate::change_stream) module docs for details.
     pub fn change_stream_query(
         &self,
         change_stream_name: impl Into<String>,

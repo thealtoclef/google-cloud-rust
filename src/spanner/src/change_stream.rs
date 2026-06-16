@@ -393,52 +393,61 @@ impl ChangeStreamRecordStream {
     /// Returns an error if the underlying RPC stream fails or if record
     /// deserialization fails.
     pub async fn next(&mut self) -> Option<crate::Result<ChangeStreamEntry>> {
-        // Drain buffered entries first (from IMMUTABLE multi-record rows).
-        if let Some(entry) = self.pending.pop() {
-            return Some(Ok(entry));
-        }
+        loop {
+            // Drain buffered entries first (from IMMUTABLE multi-record rows).
+            if let Some(entry) = self.pending.pop() {
+                return Some(Ok(entry));
+            }
 
-        let row = match self.result_set.next().await? {
-            Ok(r) => r,
-            Err(e) => return Some(Err(e)),
-        };
+            let row = match self.result_set.next().await? {
+                Ok(r) => r,
+                Err(e) => return Some(Err(e)),
+            };
 
-        // Try the MUTABLE_KEY_RANGE path first: single PROTO column.
-        match row.try_get::<Vec<u8>, _>("ChangeRecord") {
-            Ok(proto_bytes) => {
+            // Detect wire format from the first column's type code.
+            let is_proto = row
+                .metadata
+                .column_types()
+                .first()
+                .map(|t| t.code() == crate::types::TypeCode::Proto)
+                .unwrap_or(false);
+
+            if is_proto {
+                // MUTABLE_KEY_RANGE: single PROTO column → protobuf bytes.
+                let proto_bytes: Vec<u8> = match row.try_get("ChangeRecord") {
+                    Ok(b) => b,
+                    Err(e) => return Some(Err(e)),
+                };
                 return match decode_proto_record(&proto_bytes) {
                     Ok(entry) => Some(Ok(entry)),
                     Err(e) => Some(Err(e)),
                 };
             }
-            Err(_) => {
-                // Fall through to IMMUTABLE_KEY_RANGE (ARRAY<STRUCT> / JSON).
-            }
-        }
 
-        // IMMUTABLE_KEY_RANGE path: ARRAY<STRUCT<...>> → serde_json::Value.
-        let json_value: serde_json::Value = match row.try_get("ChangeRecord") {
-            Ok(v) => v,
-            Err(e) => {
-                return Some(Err(crate::error::internal_error(format!(
-                    "failed to read ChangeRecord column: {e}"
-                ))));
-            }
-        };
-
-        match parse_json_records(&json_value) {
-            Ok(mut entries) => {
-                if entries.is_empty() {
-                    // Empty array row — recurse to pull the next row.
-                    return Box::pin(self.next()).await;
+            // IMMUTABLE_KEY_RANGE: ARRAY<STRUCT<...>> → serde_json::Value.
+            let json_value: serde_json::Value = match row.try_get("ChangeRecord") {
+                Ok(v) => v,
+                Err(e) => {
+                    return Some(Err(crate::error::internal_error(format!(
+                        "failed to read ChangeRecord column: {e}"
+                    ))));
                 }
-                // Reverse so we can pop from the back in order.
-                entries.reverse();
-                let first = entries.pop().unwrap();
-                self.pending = entries;
-                Some(Ok(first))
+            };
+
+            match parse_json_records(&json_value) {
+                Ok(mut entries) => {
+                    if entries.is_empty() {
+                        // Empty array row — loop to pull the next row.
+                        continue;
+                    }
+                    // Reverse so we can pop from the back in order.
+                    entries.reverse();
+                    let first = entries.pop().unwrap();
+                    self.pending = entries;
+                    return Some(Ok(first));
+                }
+                Err(e) => return Some(Err(e)),
             }
-            Err(e) => Some(Err(e)),
         }
     }
 }
@@ -1372,6 +1381,66 @@ mod tests {
         assert!(obj.contains_key("heartbeatRecord"));
         assert!(!obj.contains_key("dataChangeRecord"));
         assert!(!obj.contains_key("partitionStartRecord"));
+    }
+
+    #[test]
+    fn json_parse_multiple_records_in_array() {
+        let json = serde_json::json!([
+            {
+                "heartbeatRecord": { "timestamp": "2024-01-15T10:30:00Z" },
+                "dataChangeRecord": null,
+                "partitionStartRecord": null,
+                "partitionEndRecord": null,
+                "partitionEventRecord": null
+            },
+            {
+                "dataChangeRecord": {
+                    "commitTimestamp": "2024-01-15T10:30:01Z",
+                    "recordSequence": "00000001",
+                    "serverTransactionId": "txn-multi",
+                    "isLastRecordInTransactionInPartition": true,
+                    "table": "Orders",
+                    "columnMetadata": [],
+                    "mods": [],
+                    "modType": "INSERT",
+                    "valueCaptureType": "OLD_AND_NEW_VALUES",
+                    "numberOfRecordsInTransaction": 1,
+                    "numberOfPartitionsInTransaction": 1,
+                    "transactionTag": "",
+                    "isSystemTransaction": false
+                },
+                "heartbeatRecord": null,
+                "partitionStartRecord": null,
+                "partitionEndRecord": null,
+                "partitionEventRecord": null
+            }
+        ]);
+        let entries = parse_json_records(&json).expect("should parse");
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].as_heartbeat_record().is_some());
+        let dcr = entries[1]
+            .as_data_change_record()
+            .expect("second should be DataChangeRecord");
+        assert_eq!(dcr.table, "Orders");
+    }
+
+    #[test]
+    fn change_stream_entry_accessor_returns_none_for_wrong_variant() {
+        let json = serde_json::json!([{
+            "heartbeatRecord": { "timestamp": "2024-01-15T10:30:00Z" },
+            "dataChangeRecord": null,
+            "partitionStartRecord": null,
+            "partitionEndRecord": null,
+            "partitionEventRecord": null
+        }]);
+        let entries = parse_json_records(&json).expect("should parse");
+        let entry = &entries[0];
+        assert!(entry.as_heartbeat_record().is_some());
+        assert!(entry.as_data_change_record().is_none());
+        assert!(entry.as_partition_start_record().is_none());
+        assert!(entry.as_partition_end_record().is_none());
+        assert!(entry.as_partition_event_record().is_none());
+        assert!(entry.as_child_partitions_record().is_none());
     }
 
     // ── IMMUTABLE_KEY_RANGE mock-server integration test ──
