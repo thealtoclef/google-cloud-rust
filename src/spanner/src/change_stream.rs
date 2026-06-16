@@ -292,9 +292,21 @@ impl ChangeStreamRecordStream {
 
         // MUTABLE_KEY_RANGE TVF returns a single column "ChangeRecord" with
         // TypeCode::Proto containing serialized ChangeStreamRecord bytes.
+        // IMMUTABLE_KEY_RANGE returns ARRAY<STRUCT<...>> instead, which will
+        // fail this try_get — we surface a clear error in that case.
         let proto_bytes: Vec<u8> = match row.try_get("ChangeRecord") {
             Ok(v) => v,
-            Err(e) => return Some(Err(e)),
+            Err(e) => {
+                return Some(Err(crate::error::internal_error(format!(
+                    "failed to read ChangeRecord column as proto bytes: {e}. \
+                     This usually means the change stream uses the legacy \
+                     IMMUTABLE_KEY_RANGE partition mode, which returns \
+                     ARRAY<STRUCT> instead of PROTO. This API only supports \
+                     MUTABLE_KEY_RANGE change streams. Recreate the change \
+                     stream with: ALTER CHANGE STREAM <name> SET OPTIONS \
+                     (partition_mode = 'MUTABLE_KEY_RANGE')"
+                ))));
+            }
         };
 
         match decode_change_stream_record(&proto_bytes) {
