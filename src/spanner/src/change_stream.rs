@@ -19,6 +19,26 @@
 //! It wraps the underlying `ExecuteStreamingSql` RPC and yields fully-deserialized
 //! [`ChangeStreamRecord`](crate::model::ChangeStreamRecord) values.
 //!
+//! # Partition mode: `MUTABLE_KEY_RANGE` only
+//!
+//! This API targets change streams created with
+//! `OPTIONS (partition_mode = 'MUTABLE_KEY_RANGE')`. The returned record
+//! types ([`PartitionStartRecord`], [`PartitionEndRecord`],
+//! [`PartitionEventRecord`]) are defined by the
+//! [`change_stream.proto`](https://github.com/googleapis/googleapis/blob/master/google/spanner/v1/change_stream.proto)
+//! and are specific to this partition mode.
+//!
+//! Change streams created with the legacy `IMMUTABLE_KEY_RANGE` mode
+//! (the default prior to `MUTABLE_KEY_RANGE`) return a different partition
+//! lifecycle record (`ChildPartitionsRecord`) that has no proto definition.
+//! If this API encounters such a record, it returns an error directing the
+//! caller to recreate the change stream with
+//! `OPTIONS (partition_mode = 'MUTABLE_KEY_RANGE')`.
+//!
+//! [`PartitionStartRecord`]: crate::model::change_stream_record::PartitionStartRecord
+//! [`PartitionEndRecord`]: crate::model::change_stream_record::PartitionEndRecord
+//! [`PartitionEventRecord`]: crate::model::change_stream_record::PartitionEventRecord
+//!
 //! # Example
 //!
 //! ```no_run
@@ -92,6 +112,14 @@ fn escape_identifier(name: &str) -> crate::Result<String> {
 /// the `SELECT ChangeRecord FROM READ_<stream>(...)` TVF query and returns a
 /// [`ChangeStreamRecordStream`] that yields deserialized
 /// [`ChangeStreamRecord`](crate::model::ChangeStreamRecord) values.
+///
+/// # Partition mode
+///
+/// This builder targets change streams created with
+/// `OPTIONS (partition_mode = 'MUTABLE_KEY_RANGE')`. If the underlying
+/// change stream uses the legacy `IMMUTABLE_KEY_RANGE` mode, partition
+/// lifecycle records will produce an error. See the
+/// [module documentation](self) for details.
 #[derive(Clone, Debug)]
 #[must_use]
 pub struct ChangeStreamQueryBuilder {
@@ -179,9 +207,13 @@ impl ChangeStreamQueryBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the change stream name is invalid (contains
-    /// characters outside the `[A-Za-z0-9_-]` set), or if the underlying
-    /// `ExecuteStreamingSql` RPC fails.
+    /// Returns an error if:
+    /// - the change stream name is invalid (contains characters outside
+    ///   the `[A-Za-z0-9_-]` set),
+    /// - the underlying `ExecuteStreamingSql` RPC fails, or
+    /// - the change stream was created with `IMMUTABLE_KEY_RANGE` partition
+    ///   mode and returns a `ChildPartitionsRecord` (not supported — use
+    ///   `MUTABLE_KEY_RANGE` instead).
     pub async fn execute(self) -> crate::Result<ChangeStreamRecordStream> {
         let escaped_name = escape_identifier(&self.change_stream_name)?;
 
@@ -221,6 +253,12 @@ impl ChangeStreamQueryBuilder {
 /// that contain tokens for child partitions. Callers should spawn new
 /// `ChangeStreamRecordStream` queries for those tokens to read the full
 /// change stream.
+///
+/// # Partition mode
+///
+/// Only `MUTABLE_KEY_RANGE` change streams are supported.  If the stream
+/// encounters a `ChildPartitionsRecord` (from a legacy `IMMUTABLE_KEY_RANGE`
+/// stream), [`next`](Self::next) returns an error.
 #[derive(Debug)]
 pub struct ChangeStreamRecordStream {
     result_set: ResultSet,
@@ -280,6 +318,11 @@ const ONEOF_FIELDS: &[&str] = &[
     "partition_event_record",
 ];
 
+/// Field names used by the legacy `IMMUTABLE_KEY_RANGE` partition mode.
+/// If any of these keys appear (even as null) in a record, it means the
+/// change stream was created without `partition_mode = 'MUTABLE_KEY_RANGE'`.
+const IMMUTABLE_KEY_RANGE_FIELDS: &[&str] = &["childPartitionsRecord", "child_partitions_record"];
+
 fn parse_change_stream_records(
     json_value: &serde_json::Value,
 ) -> crate::Result<Vec<ChangeStreamRecord>> {
@@ -296,6 +339,7 @@ fn parse_change_stream_records(
 
     let mut records = Vec::with_capacity(array.len());
     for element in array {
+        check_immutable_key_range(element)?;
         let cleaned = strip_null_oneof_fields(element);
         let record: ChangeStreamRecord = serde_json::from_value(cleaned).map_err(|e| {
             crate::error::internal_error(format!("failed to deserialize ChangeStreamRecord: {e}"))
@@ -304,6 +348,28 @@ fn parse_change_stream_records(
     }
 
     Ok(records)
+}
+
+/// Returns an error if the JSON object contains a `ChildPartitionsRecord`
+/// key, which indicates the change stream uses the legacy
+/// `IMMUTABLE_KEY_RANGE` partition mode not supported by this API.
+fn check_immutable_key_range(value: &serde_json::Value) -> crate::Result<()> {
+    if let serde_json::Value::Object(map) = value {
+        for key in IMMUTABLE_KEY_RANGE_FIELDS {
+            if map.contains_key(*key) {
+                return Err(crate::error::internal_error(
+                    "received a ChildPartitionsRecord, which indicates this change stream \
+                     uses the legacy IMMUTABLE_KEY_RANGE partition mode. This API only \
+                     supports MUTABLE_KEY_RANGE change streams. Recreate the change stream \
+                     with: ALTER CHANGE STREAM <name> SET OPTIONS \
+                     (partition_mode = 'MUTABLE_KEY_RANGE') or CREATE CHANGE STREAM <name> \
+                     ... OPTIONS (partition_mode = 'MUTABLE_KEY_RANGE')"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Remove null-valued oneof fields so the generated deserializer does not
@@ -568,6 +634,105 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(records[0].partition_start_record().is_some());
     }
+
+    // ── IMMUTABLE_KEY_RANGE detection ──
+
+    #[test]
+    fn reject_child_partitions_record_camel_case() {
+        let json = serde_json::json!([{
+            "childPartitionsRecord": {
+                "startTimestamp": "2024-01-15T10:30:00Z",
+                "recordSequence": "00000001",
+                "childPartitions": [
+                    {"token": "child-token-1", "parentPartitionTokens": ["parent-1"]}
+                ]
+            }
+        }]);
+
+        let err = parse_change_stream_records(&json).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ChildPartitionsRecord"),
+            "error should mention ChildPartitionsRecord, got: {msg}"
+        );
+        assert!(
+            msg.contains("MUTABLE_KEY_RANGE"),
+            "error should mention MUTABLE_KEY_RANGE, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_child_partitions_record_snake_case() {
+        let json = serde_json::json!([{
+            "child_partitions_record": {
+                "start_timestamp": "2024-01-15T10:30:00Z",
+                "record_sequence": "00000001",
+                "child_partitions": [
+                    {"token": "child-token-1", "parent_partition_tokens": ["parent-1"]}
+                ]
+            }
+        }]);
+
+        let err = parse_change_stream_records(&json).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ChildPartitionsRecord"),
+            "error should mention ChildPartitionsRecord, got: {msg}"
+        );
+        assert!(
+            msg.contains("MUTABLE_KEY_RANGE"),
+            "error should mention MUTABLE_KEY_RANGE, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_null_child_partitions_record() {
+        // Even a null-valued childPartitionsRecord key indicates the wrong
+        // partition mode — the key itself should never appear in
+        // MUTABLE_KEY_RANGE streams.
+        let json = serde_json::json!([{
+            "dataChangeRecord": {
+                "commitTimestamp": "2024-01-15T10:30:00Z",
+                "recordSequence": "00000001",
+                "serverTransactionId": "txn-999",
+                "isLastRecordInTransactionInPartition": true,
+                "table": "Users",
+                "columnMetadata": [],
+                "mods": [],
+                "modType": "INSERT",
+                "valueCaptureType": "OLD_AND_NEW_VALUES",
+                "numberOfRecordsInTransaction": 1,
+                "numberOfPartitionsInTransaction": 1
+            },
+            "childPartitionsRecord": null
+        }]);
+
+        let err = parse_change_stream_records(&json).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("IMMUTABLE_KEY_RANGE"),
+            "error should mention IMMUTABLE_KEY_RANGE, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn accept_mutable_key_range_records() {
+        // Verify that MUTABLE_KEY_RANGE record types pass the check without error.
+        let json = serde_json::json!([{
+            "partitionStartRecord": {
+                "startTimestamp": "2024-01-15T10:30:00Z",
+                "recordSequence": "00000001",
+                "partitionTokens": ["token-a", "token-b"]
+            }
+        }]);
+
+        let records =
+            parse_change_stream_records(&json).expect("should accept MUTABLE_KEY_RANGE record");
+        assert_eq!(records.len(), 1);
+        assert!(records[0].partition_start_record().is_some());
+    }
+
+    // ── JSON deserialization: mods ──
 
     #[test]
     fn parse_data_change_record_with_mods() {
