@@ -276,7 +276,7 @@ impl DatabaseClient {
     /// ```
     ///
     /// Builds and executes a change stream TVF query
-    /// (`SELECT ChangeRecord FROM READ_<name>(...)`) with `queryMode = PROFILE`,
+    /// (`SELECT ChangeRecord FROM READ_<name>(...)`) via `ExecuteStreamingSql`,
     /// returning a stream of fully-deserialized
     /// [`ChangeStreamRecord`](crate::model::ChangeStreamRecord) values.
     pub fn change_stream_query(
@@ -286,16 +286,7 @@ impl DatabaseClient {
         crate::change_stream::ChangeStreamQueryBuilder::new(self.clone(), change_stream_name)
     }
 
-    /// Returns a reference to the underlying [`Spanner`] client.
-    ///
-    /// This can be used to issue lower-level RPCs such as
-    /// [`Spanner::execute_streaming_sql`].
-    pub fn spanner(&self) -> &Spanner {
-        &self.spanner
-    }
-
-    /// Returns the current session name for this database client.
-    pub fn session_name(&self) -> String {
+    pub(crate) fn session_name(&self) -> String {
         self.session_maintainer.session_name()
     }
 }

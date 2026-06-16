@@ -86,8 +86,7 @@ pub(crate) mod result_set;
 pub(crate) mod result_set_metadata;
 pub(crate) mod retry_policy;
 pub(crate) mod row;
-/// Server streaming response types (e.g., for `ExecuteStreamingSql`).
-pub mod server_streaming;
+pub(crate) mod server_streaming;
 pub(crate) mod session_maintainer;
 pub(crate) mod timestamp_bound;
 pub(crate) mod to_value;

@@ -315,7 +315,7 @@ impl Spanner {
     ///
     /// This is a custom streaming implementation over the underlying Spanner gRPC
     /// transport, since streaming responses are not yet auto-generated here.
-    pub fn execute_streaming_sql(
+    pub(crate) fn execute_streaming_sql(
         &self,
         request: crate::model::ExecuteSqlRequest,
         options: crate::RequestOptions,
