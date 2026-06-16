@@ -151,11 +151,13 @@ impl ChangeStreamQueryBuilder {
     ///   start_timestamp => @start_timestamp,
     ///   end_timestamp   => @end_timestamp,
     ///   partition_token  => @partition_token,
+    ///   read_options     => null,
     ///   heartbeat_milliseconds => @heartbeat_milliseconds
     /// )
     /// ```
     /// and executes it via `ExecuteStreamingSql` on a single-use read-only
-    /// transaction.
+    /// transaction (matching the approach used by the Apache Beam Spanner
+    /// Change Streams connector).
     pub async fn execute(self) -> crate::Result<ChangeStreamRecordStream> {
         let escaped_name = escape_identifier(&self.change_stream_name)?;
 
@@ -164,6 +166,7 @@ impl ChangeStreamQueryBuilder {
              start_timestamp => @start_timestamp, \
              end_timestamp => @end_timestamp, \
              partition_token => @partition_token, \
+             read_options => null, \
              heartbeat_milliseconds => @heartbeat_milliseconds\
              )"
         );
