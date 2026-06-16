@@ -14,81 +14,10 @@
 
 //! Change stream query support for Spanner.
 //!
-//! This module provides a high-level API for querying Spanner
-//! [change streams](https://cloud.google.com/spanner/docs/change-streams).
-//! It wraps the underlying `ExecuteStreamingSql` RPC and yields
-//! [`ChangeStreamEntry`] values that cover both partition modes.
-//!
-//! # Partition modes
-//!
-//! Spanner change streams can be created with one of two partition modes:
-//!
-//! - **`MUTABLE_KEY_RANGE`** (newer) — returns proto-encoded
-//!   [`ChangeStreamRecord`](crate::model::ChangeStreamRecord) bytes
-//!   (`TypeCode::Proto`). Supports richer lifecycle events:
-//!   [`PartitionStartRecord`], [`PartitionEndRecord`], [`PartitionEventRecord`].
-//!   Requires a non-null `end_timestamp`.
-//!
-//! - **`IMMUTABLE_KEY_RANGE`** (legacy, the default) — returns
-//!   `ARRAY<STRUCT<...>>` JSON. Partition lifecycle uses
-//!   [`ChildPartitionsRecord`] (no proto definition; hand-written in this
-//!   module). Allows null `end_timestamp` for indefinite streaming.
-//!
-//! The API auto-detects the mode from the column type metadata and
-//! deserializes accordingly. All record types are unified under the
-//! [`ChangeStreamEntry`] enum.
-//!
-//! [`PartitionStartRecord`]: crate::model::change_stream_record::PartitionStartRecord
-//! [`PartitionEndRecord`]: crate::model::change_stream_record::PartitionEndRecord
-//! [`PartitionEventRecord`]: crate::model::change_stream_record::PartitionEventRecord
-//!
-//! # Example
-//!
-//! ```no_run
-//! # use google_cloud_spanner::client::Spanner;
-//! # use google_cloud_spanner::change_stream::ChangeStreamEntry;
-//! # async fn example() -> anyhow::Result<()> {
-//! let spanner = Spanner::builder().build().await?;
-//! let db = spanner
-//!     .database_client("projects/p/instances/i/databases/d")
-//!     .build()
-//!     .await?;
-//!
-//! let now = time::OffsetDateTime::now_utc();
-//! let end = now + time::Duration::minutes(2);
-//!
-//! let mut stream = db
-//!     .change_stream_query("MyChangeStream")
-//!     .with_start_timestamp(now)
-//!     .with_end_timestamp(end)
-//!     .with_heartbeat_milliseconds(10_000)
-//!     .execute()
-//!     .await?;
-//!
-//! while let Some(entry) = stream.next().await {
-//!     match entry? {
-//!         ChangeStreamEntry::DataChangeRecord(dcr) => {
-//!             println!("data change in {}", dcr.table);
-//!         }
-//!         ChangeStreamEntry::HeartbeatRecord(hb) => {
-//!             println!("heartbeat: {:?}", hb.timestamp);
-//!         }
-//!         other => println!("{other:?}"),
-//!     }
-//! }
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Partition management
-//!
-//! A change stream is split across partitions whose lifetimes are controlled
-//! by Spanner. Callers are responsible for spawning additional queries when
-//! partition lifecycle records are received:
-//! - `MUTABLE_KEY_RANGE`: [`PartitionStartRecord`](crate::model::change_stream_record::PartitionStartRecord)
-//!   contains tokens for new partitions.
-//! - `IMMUTABLE_KEY_RANGE`: [`ChildPartitionsRecord`] contains child partition
-//!   tokens after a split.
+//! Wraps `ExecuteStreamingSql` to query
+//! [change streams](https://cloud.google.com/spanner/docs/change-streams),
+//! auto-detecting `MUTABLE_KEY_RANGE` (proto) and `IMMUTABLE_KEY_RANGE`
+//! (JSON) wire formats from column metadata. Returns [`ChangeStreamEntry`].
 
 use crate::database_client::DatabaseClient;
 use crate::model::ChangeStreamRecord;
@@ -113,11 +42,7 @@ pub struct ChildPartition {
 
 /// Partition split record returned by `IMMUTABLE_KEY_RANGE` change streams.
 ///
-/// This type has no proto definition; it is parsed from the `ARRAY<STRUCT>`
-/// JSON wire format. It is the legacy counterpart to the proto-defined
-/// [`PartitionStartRecord`](crate::model::change_stream_record::PartitionStartRecord)
-/// and [`PartitionEndRecord`](crate::model::change_stream_record::PartitionEndRecord)
-/// used by `MUTABLE_KEY_RANGE`.
+/// No proto definition exists; parsed from the `ARRAY<STRUCT>` JSON wire format.
 #[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -134,11 +59,8 @@ pub struct ChildPartitionsRecord {
 
 /// A single entry from a change stream query.
 ///
-/// This enum unifies the record types from both partition modes:
-/// - `DataChangeRecord` and `HeartbeatRecord` are shared across both modes.
-/// - `PartitionStartRecord`, `PartitionEndRecord`, `PartitionEventRecord`
-///   are specific to `MUTABLE_KEY_RANGE`.
-/// - `ChildPartitionsRecord` is specific to `IMMUTABLE_KEY_RANGE`.
+/// Unifies record types from both `MUTABLE_KEY_RANGE` and
+/// `IMMUTABLE_KEY_RANGE` partition modes.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum ChangeStreamEntry {
@@ -241,15 +163,8 @@ fn escape_identifier(name: &str) -> crate::Result<String> {
 
 /// A builder for change stream queries.
 ///
-/// Created by [`DatabaseClient::change_stream_query`]. The builder constructs
-/// the `SELECT ChangeRecord FROM READ_<stream>(...)` TVF query and returns a
-/// [`ChangeStreamRecordStream`] that yields [`ChangeStreamEntry`] values.
-///
-/// # Partition mode
-///
-/// Both `MUTABLE_KEY_RANGE` and `IMMUTABLE_KEY_RANGE` change streams are
-/// supported. The wire format is auto-detected from the column type metadata.
-/// See the [module documentation](self) for details.
+/// Created by [`DatabaseClient::change_stream_query`]. Supports both
+/// `MUTABLE_KEY_RANGE` and `IMMUTABLE_KEY_RANGE` partition modes.
 #[derive(Clone, Debug)]
 #[must_use]
 pub struct ChangeStreamQueryBuilder {
@@ -284,14 +199,8 @@ impl ChangeStreamQueryBuilder {
 
     /// Sets the end timestamp for the change stream query.
     ///
-    /// - `MUTABLE_KEY_RANGE` change streams **require** a non-null end
-    ///   timestamp. The Apache Beam connector uses a rolling window of
-    ///   `now + 2 minutes`.
-    /// - `IMMUTABLE_KEY_RANGE` change streams accept `None` / NULL for
-    ///   indefinite streaming.
-    ///
-    /// Defaults to `None`. Callers querying `MUTABLE_KEY_RANGE` streams
-    /// **must** call this method (Spanner rejects NULL).
+    /// Required for `MUTABLE_KEY_RANGE` (Spanner rejects NULL). Optional
+    /// for `IMMUTABLE_KEY_RANGE`.
     pub fn with_end_timestamp(mut self, ts: time::OffsetDateTime) -> Self {
         self.end_timestamp = Some(ts);
         self
@@ -324,17 +233,11 @@ impl ChangeStreamQueryBuilder {
         self
     }
 
-    /// Executes the change stream query and returns a stream of
-    /// [`ChangeStreamEntry`] values.
-    ///
-    /// The partition mode (`MUTABLE_KEY_RANGE` vs `IMMUTABLE_KEY_RANGE`) is
-    /// auto-detected from the result column type: `PROTO` for mutable,
-    /// `ARRAY<STRUCT>` for immutable.
+    /// Executes the change stream query and returns a record stream.
     ///
     /// # Errors
     ///
-    /// Returns an error if the change stream name is invalid or the
-    /// underlying `ExecuteStreamingSql` RPC fails.
+    /// Returns an error if the stream name is invalid or the RPC fails.
     pub async fn execute(self) -> crate::Result<ChangeStreamRecordStream> {
         let escaped_name = escape_identifier(&self.change_stream_name)?;
 
@@ -367,14 +270,8 @@ impl ChangeStreamQueryBuilder {
 
 /// A stream of [`ChangeStreamEntry`] values from a change stream query.
 ///
-/// Each call to [`next`](Self::next) pulls the next row from the underlying
-/// `ResultSet`, auto-detects the wire format (`PROTO` for `MUTABLE_KEY_RANGE`,
-/// `ARRAY<STRUCT>` for `IMMUTABLE_KEY_RANGE`), and yields a
-/// [`ChangeStreamEntry`].
-///
-/// For `IMMUTABLE_KEY_RANGE`, a single row may contain multiple records in
-/// the `ARRAY<STRUCT>` column; these are buffered internally and yielded
-/// one at a time.
+/// Call [`next`](Self::next) to pull entries. `IMMUTABLE_KEY_RANGE` rows
+/// may contain multiple records; these are buffered and yielded one at a time.
 #[derive(Debug)]
 pub struct ChangeStreamRecordStream {
     result_set: ResultSet,
