@@ -89,7 +89,7 @@ pub(crate) mod timestamp_bound;
 pub(crate) mod to_value;
 pub(crate) mod transaction_retry_policy;
 pub(crate) mod transaction_runner;
-pub(crate) mod types;
+pub mod types;
 pub(crate) mod write_only_transaction;
 
 mod status;
