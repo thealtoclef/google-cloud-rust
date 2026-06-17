@@ -255,6 +255,32 @@ impl DatabaseClient {
         BatchWriteTransactionBuilder::new(self.clone())
     }
 
+    /// Returns a builder for a change stream query.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use google_cloud_spanner::client::Spanner;
+    /// # async fn run(spanner: Spanner) -> Result<(), google_cloud_spanner::Error> {
+    /// let db_client = spanner.database_client("projects/p/instances/i/databases/d").build().await?;
+    /// let mut stream = db_client.change_stream_query("MyChangeStream")
+    ///     .with_heartbeat_milliseconds(10_000)
+    ///     .execute()
+    ///     .await?;
+    /// while let Some(entry) = stream.next().await {
+    ///     println!("{entry:?}");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// See the [`change_stream`](crate::change_stream) module for details.
+    pub fn change_stream_query(
+        &self,
+        change_stream_name: impl Into<String>,
+    ) -> crate::change_stream::ChangeStreamQueryBuilder {
+        crate::change_stream::ChangeStreamQueryBuilder::new(self.clone(), change_stream_name)
+    }
+
     pub(crate) fn session_name(&self) -> String {
         self.session_maintainer.session_name()
     }

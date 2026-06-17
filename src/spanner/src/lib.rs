@@ -44,6 +44,9 @@ pub(crate) use google_cloud_gax::options::RequestOptions;
 pub(crate) use google_cloud_gax::options::internal::RequestBuilder;
 pub(crate) use google_cloud_gax::response::Response;
 
+/// Change stream query helpers.
+pub mod change_stream;
+
 /// Spanner client implementations.
 pub mod client;
 
